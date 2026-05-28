@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-telegram-bot-api-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first Telegram Bot API proxy with safe cloud fallback for OpenClaw.",
+  "scripts": {
+    "check": "node --check src/telegram-bot-api-proxy.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
