@@ -4,23 +4,40 @@ import https from "node:https";
 import fs from "node:fs";
 import { URL } from "node:url";
 
+// Хост, на котором proxy принимает запросы от OpenClaw.
 const listenHost = process.env.LISTEN_HOST || "127.0.0.1";
+// Порт proxy; в OpenClaw этот адрес указывается как Telegram apiRoot.
 const listenPort = Number.parseInt(process.env.PORT || "8082", 10);
+// Основной upstream: локальный telegram-bot-api, обычно Docker-контейнер.
 const localRoot = trimRoot(process.env.LOCAL_API_ROOT || "http://127.0.0.1:8081");
+// Резервный upstream: официальный Telegram Bot API.
 const cloudRoot = trimRoot(process.env.CLOUD_API_ROOT || "https://api.telegram.org");
+// Флаг, разрешающий аварийный переход с local API на cloud API.
 const cloudFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_FALLBACK, false);
+// Каталог с OpenClaw offset-файлами, по которым защищаем getUpdates от отката.
 const telegramOffsetDir = process.env.TELEGRAM_OFFSET_DIR || "telegram";
+// Максимальный известный размер файла, который разрешено скачать через cloud fallback.
 const cloudFileFallbackMaxBytes = Number.parseInt(process.env.CLOUD_FILE_FALLBACK_MAX_BYTES || String(20 * 1024 * 1024), 10);
+// Максимальный размер запроса, который proxy может буферизовать для повторной отправки.
 const bufferLimitBytes = Number.parseInt(process.env.BUFFER_LIMIT_BYTES || String(8 * 1024 * 1024), 10);
+// Время, на которое успешная проверка local API считается свежей.
 const localHealthTtlMs = Number.parseInt(process.env.LOCAL_HEALTH_TTL_MS || "5000", 10);
+// Пауза после ошибки local API перед новой health-check попыткой.
 const localUnhealthyCooldownMs = Number.parseInt(process.env.LOCAL_UNHEALTHY_COOLDOWN_MS || "5000", 10);
+// Таймаут health-check запроса getMe к local API.
 const localHealthTimeoutMs = Number.parseInt(process.env.LOCAL_HEALTH_TIMEOUT_MS || "2000", 10);
+// Общий таймаут запроса к upstream API.
 const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || "130000", 10);
 
+// Момент, до которого local API считается здоровым без повторной проверки.
 let localHealthyUntil = 0;
+// Момент, до которого local API считается нездоровым после сетевой ошибки.
 let localUnhealthyUntil = 0;
+// Последнее залогированное состояние health-check, чтобы не шуметь одинаковыми строками.
 let lastHealthLogState = "";
+// Отдельный cloud cursor по каждому botId для безопасного fallback getUpdates.
 const cloudUpdateStateByBotId = new Map();
+// Кэш file_path -> file_size из getFile, чтобы решать, можно ли фолбечить /file.
 const fileInfoByBotIdAndPath = new Map();
 
 function trimRoot(value) {
@@ -530,6 +547,7 @@ async function handleStreaming(req, res, method, token, startedAt) {
   }
 }
 
+// Верхнеуровневый HTTP-сервер принимает все запросы OpenClaw и выбирает buffered или streaming путь.
 const server = http.createServer(async (req, res) => {
   const startedAt = Date.now();
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
@@ -552,10 +570,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
   log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudFileMaxBytes=${cloudFileFallbackMaxBytes}`);
 });
 
+// При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.
 process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
