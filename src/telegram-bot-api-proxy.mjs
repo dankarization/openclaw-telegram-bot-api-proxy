@@ -40,28 +40,34 @@ const cloudUpdateStateByBotId = new Map();
 // Кэш file_path -> file_size из getFile, чтобы решать, можно ли фолбечить /file.
 const fileInfoByBotIdAndPath = new Map();
 
+// Убираем завершающие слэши у root URL, чтобы дальше безопасно склеивать root + req.url.
 function trimRoot(value) {
   return String(value || "").replace(/\/+$/u, "");
 }
 
+// Читаем булевы env-флаги в привычных вариантах: 1/true/yes/on.
 function parseBoolean(value, fallback) {
   if (value == null || value === "") return fallback;
   return /^(1|true|yes|on)$/iu.test(String(value).trim());
 }
 
+// Пишем обычный operational log в stdout; systemd складывает его в файл.
 function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
 }
 
+// Ошибки идут в stderr, но systemd unit направляет stderr в тот же proxy log.
 function logError(message) {
   process.stderr.write(`${new Date().toISOString()} ${message}\n`);
 }
 
+// Достаём bot token из Telegram API path вида /bot<TOKEN>/... или /file/bot<TOKEN>/...
 function tokenFromPath(pathname) {
   const match = pathname.match(/^\/(?:file\/)?bot([^/]+)/u);
   return match ? match[1] : "";
 }
 
+// Нормализуем имя Telegram API метода, чтобы одна политика работала для buffered и streaming путей.
 function methodFromPath(pathname) {
   const botMatch = pathname.match(/^\/bot[^/]+\/([^/?#]+)/u);
   if (botMatch) return botMatch[1] || "unknown";
@@ -69,6 +75,7 @@ function methodFromPath(pathname) {
   return "unknown";
 }
 
+// Вытаскиваем file_path из /file/bot<TOKEN>/<file_path> для проверки размера перед cloud fallback.
 function filePathFromPathname(pathname) {
   const match = pathname.match(/^\/file\/bot[^/]+\/(.+)$/u);
   if (!match) return "";
@@ -79,6 +86,8 @@ function filePathFromPathname(pathname) {
   }
 }
 
+// Методы из этого списка можно повторить через cloud, если local вернул серверную ошибку.
+// getUpdates дополнительно проходит offset/cursor guard, поэтому он здесь допустим.
 function isSafeMethodForStatusFallback(method) {
   return new Set([
     "getMe",
@@ -95,6 +104,7 @@ function isSafeMethodForStatusFallback(method) {
   ]).has(method);
 }
 
+// Ключ кэша размера файла привязан к botId, потому что file_path уникален в рамках бота.
 function fileInfoKey(token, filePath) {
   return `${botIdFromToken(token)}:${filePath}`;
 }
