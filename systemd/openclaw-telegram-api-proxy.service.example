@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenClaw Telegram Bot API local/cloud proxy
+Description=OpenClaw Telegram Bot API proxy с local/cloud fallback
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300

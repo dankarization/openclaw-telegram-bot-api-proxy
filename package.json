@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local-first Telegram Bot API proxy with safe cloud fallback for OpenClaw.",
+  "description": "Telegram Bot API proxy для OpenClaw с приоритетом локального API и безопасным cloud fallback.",
   "scripts": {
     "check": "node --check src/telegram-bot-api-proxy.mjs"
   },

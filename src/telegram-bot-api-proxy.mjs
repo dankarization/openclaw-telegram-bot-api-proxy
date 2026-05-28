@@ -103,7 +103,7 @@ function cacheGetFileResult(method, token, upstream) {
     if (!payload?.ok || typeof filePath !== "string" || !filePath) return;
     cacheFileInfo(token, filePath, payload.result.file_size);
   } catch {
-    // Ignore non-JSON or unexpected getFile responses.
+    // Игнорируем не-JSON и неожиданные ответы getFile.
   }
 }
 
@@ -187,7 +187,7 @@ function bodyWithOffset(req, body, offset) {
       const payload = JSON.parse(body.toString("utf8"));
       return { reqUrl: req.url, body: Buffer.from(JSON.stringify({ ...payload, offset })) };
     } catch {
-      // Fall through to query-string translation.
+      // Если JSON не разобрался, попробуем перенести offset в query string.
     }
   }
   if (body?.length && type.includes("x-www-form-urlencoded")) {
