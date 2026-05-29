@@ -26,7 +26,10 @@ OpenClaw Gateway
   local Bot API, чтобы они не возвращались снова.
 - `/file/...` уходит в cloud только если размер известен из `getFile` и не
   больше `CLOUD_FILE_FALLBACK_MAX_BYTES`.
-- Файлы неизвестного размера, тяжёлые файлы и multipart uploads остаются только на local API.
+- Файлы неизвестного размера и тяжёлые файлы остаются только на local API.
+- Отправка файлов через `multipart/form-data`, где в HTTP-запросе идут сами
+  байты файла, не fallback-ится в cloud: такой stream нельзя безопасно
+  повторить, а cloud Bot API не рассчитан на наши большие local-файлы.
 
 ## Требования
 

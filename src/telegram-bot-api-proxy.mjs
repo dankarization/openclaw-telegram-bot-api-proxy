@@ -37,6 +37,36 @@ const cloudPendingProbeTtlMs = Number.parseInt(process.env.CLOUD_PENDING_PROBE_T
 // Максимальный возраст cloud update, который можно виртуально поднять над local offset.
 const cloudFreshUpdateMaxAgeMs = Number.parseInt(process.env.CLOUD_FRESH_UPDATE_MAX_AGE_MS || String(6 * 60 * 60 * 1000), 10);
 
+// Служебные методы local/cloud Bot API, которые не отправляют пользовательский контент.
+const localAdminMethods = new Set(["getMe", "getUpdates", "getWebhookInfo", "deleteWebhook"]);
+// Методы, которые можно отправить в cloud fallback без передачи тяжелых файловых тел.
+const safeCloudFallbackMethods = new Set([
+  ...localAdminMethods,
+  "getFile",
+  "sendMessage",
+  "editMessageText",
+  "editMessageCaption",
+  "editMessageReplyMarkup",
+  "deleteMessage",
+  "answerCallbackQuery",
+  "sendChatAction",
+  "setMyCommands",
+  "deleteMyCommands",
+  "setMyDescription",
+  "setMyShortDescription",
+  "setMyName",
+  "setChatMenuButton",
+]);
+// Методы владения token/webhook не фолбечим в cloud автоматически.
+const localOnlyMethods = new Set(["close", "logOut", "logout", "setWebhook"]);
+// Легкие счетчики живых streaming-запросов для operational logs.
+const streamingCounters = {
+  active: 0,
+  upload: 0,
+  download: 0,
+  passthrough: 0,
+};
+
 // Момент, до которого local API считается здоровым без повторной проверки.
 let localHealthyUntil = 0;
 // Момент, до которого local API считается нездоровым после сетевой ошибки.
@@ -78,14 +108,21 @@ function parseBoolean(value, fallback) {
   return /^(1|true|yes|on)$/iu.test(String(value).trim());
 }
 
+// Маскируем Telegram bot token в любых лог-строках, включая неожиданные тексты ошибок.
+function sanitizeLogMessage(message) {
+  return String(message)
+    .replace(/\/((?:file\/)?bot)(\d+):[^/\s]+/gu, "/$1$2:<hidden-token>")
+    .replace(/\b(\d{5,}):[A-Za-z0-9_-]{20,}\b/gu, "$1:<hidden-token>");
+}
+
 // Пишем обычный operational log в stdout; systemd складывает его в файл.
 function log(message) {
-  process.stdout.write(`${new Date().toISOString()} ${message}\n`);
+  process.stdout.write(`${new Date().toISOString()} ${sanitizeLogMessage(message)}\n`);
 }
 
 // Ошибки идут в stderr, но systemd unit направляет stderr в тот же proxy log.
 function logError(message) {
-  process.stderr.write(`${new Date().toISOString()} ${message}\n`);
+  process.stderr.write(`${new Date().toISOString()} ${sanitizeLogMessage(message)}\n`);
 }
 
 // Достаём bot token из Telegram API path вида /bot<TOKEN>/... или /file/bot<TOKEN>/...
@@ -113,22 +150,9 @@ function filePathFromPathname(pathname) {
   }
 }
 
-// Методы из этого списка можно повторить через cloud, если local вернул серверную ошибку.
-// getUpdates дополнительно проходит offset/cursor guard, поэтому он здесь допустим.
+// Методы из safeCloudFallbackMethods можно повторить через cloud, если local вернул серверную ошибку.
 function isSafeMethodForStatusFallback(method) {
-  return new Set([
-    "getMe",
-    "getUpdates",
-    "getWebhookInfo",
-    "deleteWebhook",
-    "setMyCommands",
-    "deleteMyCommands",
-    "setMyDescription",
-    "setMyShortDescription",
-    "setMyName",
-    "setChatMenuButton",
-    "sendChatAction",
-  ]).has(method);
+  return safeCloudFallbackMethods.has(method);
 }
 
 // Ключ кэша размера файла привязан к botId, потому что file_path уникален в рамках бота.
@@ -180,13 +204,33 @@ function processGetFileResult(method, token, upstream, target) {
   return upstream;
 }
 
-function canUseCloudFallback(method, token, pathname = "") {
-  if (!cloudFallbackEnabled) return false;
-  if (method !== "file") return true;
+function contentType(req) {
+  return String(req?.headers?.["content-type"] || "").toLowerCase();
+}
+
+function isMultipartUploadRequest(req) {
+  return contentType(req).includes("multipart/form-data");
+}
+
+function cloudFallbackPolicy(method, token, pathname = "", req = null) {
+  if (!cloudFallbackEnabled) return { allowed: false, reason: "fallback-disabled" };
+  if (localOnlyMethods.has(method)) return { allowed: false, reason: "local-only-method" };
+  if (req && isMultipartUploadRequest(req)) return { allowed: false, reason: "multipart-upload-local-only" };
+
+  if (method !== "file") {
+    if (safeCloudFallbackMethods.has(method)) return { allowed: true, reason: "safe-method" };
+    return { allowed: true, reason: "default-non-file-method" };
+  }
 
   const filePath = filePathFromPathname(pathname);
   const info = cachedFileInfo(token, filePath);
-  return info?.fileSize != null && info.fileSize <= cloudFileFallbackMaxBytes;
+  if (info?.fileSize == null) return { allowed: false, reason: "file-size-unknown" };
+  if (info.fileSize > cloudFileFallbackMaxBytes) return { allowed: false, reason: "file-too-large" };
+  return { allowed: true, reason: "file-size-within-cloud-limit" };
+}
+
+function canUseCloudFallback(method, token, pathname = "", req = null) {
+  return cloudFallbackPolicy(method, token, pathname, req).allowed;
 }
 
 function botIdFromToken(token) {
@@ -381,6 +425,7 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
       const freshUpdateIds = fresh.map((update) => numericOffset(update?.update_id)).filter((id) => id != null);
       if (freshUpdateIds.length === 0) {
         cloudUpdateStateByBotId.set(botId, { cloudFloor: maxCloudUpdateId, virtualFloor: localFloor });
+        log(`method=getUpdates target=cloud action=virtualized-update-id result=0 dropped=${payload.result.length} floor=${localFloor} reason=stale-cloud-updates`);
         return {
           upstream: jsonCloudResponse(upstream, { ...payload, result: [] }),
           dropped: payload.result.length,
@@ -401,6 +446,7 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
         return { ...update, update_id: virtualUpdateId };
       });
       cloudUpdateStateByBotId.set(botId, { cloudFloor: nextCloudFloor, virtualFloor: nextVirtualFloor });
+      log(`method=getUpdates target=cloud action=virtualized-update-id count=${result.length} dropped=${payload.result.length - result.length} cloudFloor=${nextCloudFloor} virtualFloor=${nextVirtualFloor}`);
       return {
         upstream: jsonCloudResponse(upstream, { ...payload, result }),
         dropped: payload.result.length - result.length,
@@ -448,6 +494,7 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
 
     if (botId && nextCloudFloor !== state.cloudFloor) {
       cloudUpdateStateByBotId.set(botId, { cloudFloor: nextCloudFloor, virtualFloor: nextVirtualFloor });
+      log(`method=getUpdates target=cloud action=virtualized-update-id count=${result.length} dropped=${payload.result.length - result.length} cloudFloor=${nextCloudFloor} virtualFloor=${nextVirtualFloor}`);
     }
 
     return {
@@ -526,6 +573,7 @@ async function probeCloudPendingUpdates(token) {
   const now = Date.now();
   const cached = cloudPendingProbeByBotId.get(botId);
   if (cached && now - cached.checkedAt < cloudPendingProbeTtlMs) {
+    log(`method=getWebhookInfo target=cloud action=cloud-pending-probe pending=${cached.pending} cached=yes`);
     return { pending: cached.pending, cached: true };
   }
 
@@ -542,6 +590,7 @@ async function probeCloudPendingUpdates(token) {
     pending = 0;
   }
   cloudPendingProbeByBotId.set(botId, { pending, checkedAt: now });
+  log(`method=getWebhookInfo target=cloud action=cloud-pending-probe pending=${pending} cached=no`);
   return { pending, cached: false };
 }
 
@@ -606,7 +655,7 @@ function copyHeaders(headers) {
 function canBufferRequest(req) {
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
   if (pathname.startsWith("/file/")) return false;
-  const type = String(req.headers["content-type"] || "").toLowerCase();
+  const type = contentType(req);
   if (type.includes("multipart/form-data")) return false;
   const lengthHeader = req.headers["content-length"];
   if (lengthHeader) {
@@ -614,6 +663,26 @@ function canBufferRequest(req) {
     return Number.isFinite(length) && length <= bufferLimitBytes;
   }
   return req.method === "GET" || req.method === "HEAD" || !type || type.includes("json") || type.includes("x-www-form-urlencoded");
+}
+
+function streamingKind(req, method) {
+  if (isMultipartUploadRequest(req)) return "upload";
+  if (method === "file" || req.method === "GET" || req.method === "HEAD") return "download";
+  return "passthrough";
+}
+
+function beginStreaming(kind) {
+  streamingCounters.active += 1;
+  streamingCounters[kind] += 1;
+}
+
+function endStreaming(kind) {
+  streamingCounters.active = Math.max(0, streamingCounters.active - 1);
+  streamingCounters[kind] = Math.max(0, streamingCounters[kind] - 1);
+}
+
+function streamingCounterFields() {
+  return `activeStreaming=${streamingCounters.active} activeStreamingUploads=${streamingCounters.upload} activeStreamingDownloads=${streamingCounters.download} activeStreamingPassthrough=${streamingCounters.passthrough}`;
 }
 
 async function readRequestBody(req) {
@@ -699,7 +768,8 @@ async function handleBuffered(req, res, method, token, startedAt) {
   const body = await readRequestBody(req);
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
   const localIsHealthy = await checkLocalHealth(token);
-  const cloudFallbackAllowed = canUseCloudFallback(method, token, pathname);
+  const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
+  const cloudFallbackAllowed = cloudFallback.allowed;
   if (!localIsHealthy && cloudFallbackAllowed) {
     const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
     const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
@@ -716,7 +786,10 @@ async function handleBuffered(req, res, method, token, startedAt) {
     const localProcessed = processGetFileResult(method, token, localRaw, "local");
     const localGuard = guardedLocalGetUpdates(req, method, token, body, localProcessed);
     const local = localGuard.upstream;
-    if (localGuard.dropped > 0) await acknowledgeDroppedLocalUpdates(req, token, body, localGuard.ackOffset);
+    if (localGuard.dropped > 0) {
+      log(`method=getUpdates target=local action=dropped-local-update dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"} ackOffset=${localGuard.ackOffset ?? "none"}`);
+      await acknowledgeDroppedLocalUpdates(req, token, body, localGuard.ackOffset);
+    }
     if (cloudFallbackAllowed && (local.statusCode === 401 || local.statusCode === 404) && body.length <= bufferLimitBytes) {
       const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
@@ -764,6 +837,10 @@ async function handleBuffered(req, res, method, token, startedAt) {
       log(`method=${method} target=cloud reason=${error.code} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
+    if (!cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
+      markLocalUnhealthy(error.code);
+      log(`method=${method} target=local action=fallback-blocked reason=${cloudFallback.reason} error=${error.code} ms=${Date.now() - startedAt}`);
+    }
     throw error;
   }
 }
@@ -771,20 +848,29 @@ async function handleBuffered(req, res, method, token, startedAt) {
 async function handleStreaming(req, res, method, token, startedAt) {
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
   const localIsHealthy = await checkLocalHealth(token);
-  const cloudFallbackAllowed = canUseCloudFallback(method, token, pathname);
+  const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
+  const cloudFallbackAllowed = cloudFallback.allowed;
   const initialRoot = localIsHealthy || !cloudFallbackAllowed ? localRoot : cloudRoot;
   const initialTarget = localIsHealthy || !cloudFallbackAllowed ? "local" : "cloud";
+  const streamKind = streamingKind(req, method);
+  beginStreaming(streamKind);
   try {
     const result = await forwardStreaming(req, res, initialRoot);
-    log(`method=${method} target=${initialTarget} status=${result.statusCode} ms=${Date.now() - startedAt}`);
+    log(`method=${method} target=${initialTarget} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
   } catch (error) {
     if (cloudFallbackAllowed && initialTarget === "local" && isClearlyLocalUnavailable(error) && (req.method === "GET" || req.method === "HEAD")) {
       markLocalUnhealthy(error.code);
       const result = await forwardStreaming(req, res, cloudRoot);
-      log(`method=${method} target=cloud reason=${error.code} status=${result.statusCode} ms=${Date.now() - startedAt}`);
+      log(`method=${method} target=cloud reason=${error.code} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
       return;
     }
+    if (!cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
+      markLocalUnhealthy(error.code);
+      log(`method=${method} target=local action=fallback-blocked reason=${cloudFallback.reason} stream=${streamKind} error=${error.code} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
+    }
     throw error;
+  } finally {
+    endStreaming(streamKind);
   }
 }
 

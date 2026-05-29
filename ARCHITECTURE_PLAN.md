@@ -180,24 +180,24 @@ Nginx пример дает несколько полезных настроек
 
 ## План работ
 
-### Этап 1. Документация и воспроизводимость
+### ~~Этап 1. Документация и воспроизводимость~~
 
-- Добавить `docker-compose.example.yml`.
-- Добавить `.env.example` для Bot API и proxy.
-- Добавить `docs/token-migration.md`.
-- Добавить `docs/operations.md` с командами проверки local/cloud ownership, очереди и логов.
-- Обновить README короткой схемой: OpenClaw -> proxy -> local Bot API -> cloud fallback.
+- ~~Добавить `docker-compose.example.yml`.~~
+- ~~Добавить `.env.example` для Bot API и proxy.~~
+- ~~Добавить `docs/token-migration.md`.~~
+- ~~Добавить `docs/operations.md` с командами проверки local/cloud ownership, очереди и логов.~~
+- ~~Обновить README короткой схемой: OpenClaw -> proxy -> local Bot API -> cloud fallback.~~
 
 ### Этап 2. Укрепление proxy
 
-- Маскировать bot token в логах.
-- Добавить счетчики active streaming requests.
-- Вынести списки fallback-safe методов в именованные группы:
-  - `localAdminMethods`: `getMe`, `getUpdates`, `getWebhookInfo`, `deleteWebhook`;
-  - `safeCloudFallbackMethods`: методы без тяжелых side effects;
-  - `localOnlyMethods`: multipart upload, тяжелый `/file`, неизвестный file size.
-- Оставить cloud `getUpdates` только через текущий guarded path.
-- Явно логировать `cloud-pending-probe`, `virtualized-update-id`, `dropped-local-update`, `ack-dropped`.
+- ~~Маскировать bot token в логах.~~
+- ~~Добавить счетчики active streaming requests.~~
+- ~~Вынести fallback-policy в именованные группы и правила:~~
+  - ~~`localAdminMethods`: `getMe`, `getUpdates`, `getWebhookInfo`, `deleteWebhook`;~~
+  - ~~`safeCloudFallbackMethods`: методы без тяжелых файловых тел;~~
+  - ~~`localOnlyMethods` и dynamic local-only причины: token/webhook ownership methods, multipart upload, тяжелый `/file`, неизвестный file size.~~
+- ~~Оставить cloud `getUpdates` только через текущий guarded path.~~
+- ~~Явно логировать `cloud-pending-probe`, `virtualized-update-id`, `dropped-local-update`, `ack-dropped`.~~
 
 ### Этап 3. Docker local Bot API
 
