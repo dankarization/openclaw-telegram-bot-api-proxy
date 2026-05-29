@@ -18,6 +18,10 @@ const cloudFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_FALLBACK, fal
 const telegramOffsetDir = process.env.TELEGRAM_OFFSET_DIR || "telegram";
 // Максимальный известный размер файла, который разрешено скачать через cloud fallback.
 const cloudFileFallbackMaxBytes = Number.parseInt(process.env.CLOUD_FILE_FALLBACK_MAX_BYTES || String(20 * 1024 * 1024), 10);
+// Контейнерный префикс absolute file_path, который Docker Bot API возвращает в --local.
+const localFilePathRewriteFrom = trimPathPrefix(process.env.LOCAL_FILE_PATH_REWRITE_FROM || "");
+// Host-префикс того же volume, доступный OpenClaw для прямого чтения файла.
+const localFilePathRewriteTo = trimPathPrefix(process.env.LOCAL_FILE_PATH_REWRITE_TO || "");
 // Максимальный размер запроса, который proxy может буферизовать для повторной отправки.
 const bufferLimitBytes = Number.parseInt(process.env.BUFFER_LIMIT_BYTES || String(8 * 1024 * 1024), 10);
 // Время, на которое успешная проверка local API считается свежей.
@@ -43,6 +47,21 @@ const fileInfoByBotIdAndPath = new Map();
 // Убираем завершающие слэши у root URL, чтобы дальше безопасно склеивать root + req.url.
 function trimRoot(value) {
   return String(value || "").replace(/\/+$/u, "");
+}
+
+// Убираем хвостовые слэши у префиксов путей, чтобы сопоставление было стабильным.
+function trimPathPrefix(value) {
+  return String(value || "").replace(/\/+$/u, "");
+}
+
+// Переписываем container path в host path для getFile от local Docker Bot API.
+function rewriteLocalFilePath(filePath) {
+  if (!localFilePathRewriteFrom || !localFilePathRewriteTo || typeof filePath !== "string") return filePath;
+  if (filePath === localFilePathRewriteFrom) return localFilePathRewriteTo;
+  if (filePath.startsWith(`${localFilePathRewriteFrom}/`)) {
+    return `${localFilePathRewriteTo}${filePath.slice(localFilePathRewriteFrom.length)}`;
+  }
+  return filePath;
 }
 
 // Читаем булевы env-флаги в привычных вариантах: 1/true/yes/on.
@@ -122,16 +141,35 @@ function cachedFileInfo(token, filePath) {
   return fileInfoByBotIdAndPath.get(fileInfoKey(token, filePath)) || null;
 }
 
-function cacheGetFileResult(method, token, upstream) {
-  if (method !== "getFile" || upstream.statusCode !== 200 || !upstream.body?.length) return;
+function processGetFileResult(method, token, upstream, target) {
+  if (method !== "getFile" || upstream.statusCode !== 200 || !upstream.body?.length) return upstream;
   try {
     const payload = JSON.parse(upstream.body.toString("utf8"));
     const filePath = payload?.result?.file_path;
-    if (!payload?.ok || typeof filePath !== "string" || !filePath) return;
+    if (!payload?.ok || typeof filePath !== "string" || !filePath) return upstream;
+    const rewrittenFilePath = target === "local" ? rewriteLocalFilePath(filePath) : filePath;
     cacheFileInfo(token, filePath, payload.result.file_size);
+    if (rewrittenFilePath !== filePath) {
+      cacheFileInfo(token, rewrittenFilePath, payload.result.file_size);
+      return {
+        ...upstream,
+        headers: {
+          ...upstream.headers,
+          "content-type": "application/json",
+        },
+        body: Buffer.from(JSON.stringify({
+          ...payload,
+          result: {
+            ...payload.result,
+            file_path: rewrittenFilePath,
+          },
+        })),
+      };
+    }
   } catch {
     // Игнорируем не-JSON и неожиданные ответы getFile.
   }
+  return upstream;
 }
 
 function canUseCloudFallback(method, token, pathname = "") {
@@ -488,8 +526,8 @@ async function handleBuffered(req, res, method, token, startedAt) {
   if (!localIsHealthy && cloudFallbackAllowed) {
     const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
     const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
-    cacheGetFileResult(method, token, cloudRaw);
-    const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudRaw);
+    const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
+    const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
     const cloud = cloudResult.upstream;
     writeBufferedResponse(res, cloud);
     log(`method=${method} target=cloud reason=local-unhealthy status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
@@ -497,13 +535,13 @@ async function handleBuffered(req, res, method, token, startedAt) {
   }
 
   try {
-    const local = await forwardBuffered(req, localRoot, body);
-    cacheGetFileResult(method, token, local);
+    const localRaw = await forwardBuffered(req, localRoot, body);
+    const local = processGetFileResult(method, token, localRaw, "local");
     if (cloudFallbackAllowed && (local.statusCode === 401 || local.statusCode === 404) && body.length <= bufferLimitBytes) {
       const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
-      cacheGetFileResult(method, token, cloudRaw);
-      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudRaw);
+      const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
+      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
       log(`method=${method} target=cloud reason=local-${local.statusCode} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
@@ -512,8 +550,8 @@ async function handleBuffered(req, res, method, token, startedAt) {
     if (cloudFallbackAllowed && local.statusCode >= 500 && isSafeMethodForStatusFallback(method)) {
       const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
-      cacheGetFileResult(method, token, cloudRaw);
-      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudRaw);
+      const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
+      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
       log(`method=${method} target=cloud reason=local-${local.statusCode} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
@@ -526,8 +564,8 @@ async function handleBuffered(req, res, method, token, startedAt) {
       markLocalUnhealthy(error.code);
       const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
-      cacheGetFileResult(method, token, cloudRaw);
-      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudRaw);
+      const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
+      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
       log(`method=${method} target=cloud reason=${error.code} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);

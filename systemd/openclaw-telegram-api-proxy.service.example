@@ -15,6 +15,8 @@ Environment=CLOUD_API_ROOT=https://api.telegram.org
 Environment=ENABLE_CLOUD_FALLBACK=1
 Environment=TELEGRAM_OFFSET_DIR=telegram
 Environment=CLOUD_FILE_FALLBACK_MAX_BYTES=20971520
+Environment=LOCAL_FILE_PATH_REWRITE_FROM=/var/lib/telegram-bot-api
+Environment=LOCAL_FILE_PATH_REWRITE_TO=%h/.openclaw/workspace/apps/telegram-media-bot/var/bot-api/data
 Environment=BUFFER_LIMIT_BYTES=8388608
 Environment=LOCAL_HEALTH_TTL_MS=5000
 Environment=LOCAL_UNHEALTHY_COOLDOWN_MS=5000

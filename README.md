@@ -45,6 +45,8 @@ OpenClaw
 | `ENABLE_CLOUD_FALLBACK` | `false` | Включить cloud fallback. |
 | `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог OpenClaw offset-файлов. |
 | `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
+| `LOCAL_FILE_PATH_REWRITE_FROM` | пусто | Контейнерный префикс file_path из local Bot API. |
+| `LOCAL_FILE_PATH_REWRITE_TO` | пусто | Host-префикс того же Docker volume для OpenClaw. |
 | `BUFFER_LIMIT_BYTES` | `8388608` | Лимит буферизации API-запроса. |
 | `LOCAL_HEALTH_TTL_MS` | `5000` | TTL успешной проверки local API. |
 | `LOCAL_UNHEALTHY_COOLDOWN_MS` | `5000` | Пауза после ошибки local API. |
