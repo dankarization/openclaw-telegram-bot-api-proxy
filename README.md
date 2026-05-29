@@ -1,19 +1,17 @@
 # OpenClaw Telegram Bot API Proxy
 
-Локальный proxy для Telegram Bot API в OpenClaw.
+Proxy для OpenClaw: локальный Telegram Bot API в приоритете, cloud Bot API только как аварийный fallback.
 
-Рабочая схема:
+## Схема
 
 ```text
-OpenClaw
+OpenClaw Gateway
   -> http://127.0.0.1:8082
-  -> openclaw-telegram-api-proxy
-  -> http://127.0.0.1:8081
-  -> Docker aiogram/telegram-bot-api:latest --local
+  -> openclaw-telegram-bot-api-proxy
+      primary  -> http://127.0.0.1:8081
+                  Docker aiogram/telegram-bot-api:latest --local
+      fallback -> https://api.telegram.org
 ```
-
-Если локальный Bot API недоступен, proxy может отправить безопасные запросы в
-`https://api.telegram.org`, чтобы связь с ботом не пропала полностью.
 
 ## Поведение
 
@@ -28,13 +26,29 @@ OpenClaw
   local Bot API, чтобы они не возвращались снова.
 - `/file/...` уходит в cloud только если размер известен из `getFile` и не
   больше `CLOUD_FILE_FALLBACK_MAX_BYTES`.
-- Файлы неизвестного размера и тяжёлые файлы остаются только на local API.
+- Файлы неизвестного размера, тяжёлые файлы и multipart uploads остаются только на local API.
 
 ## Требования
 
 - Node.js 22+
 - Docker-контейнер `aiogram/telegram-bot-api:latest` на `127.0.0.1:8081`
+- Docker Compose v2 для `docker-compose.example.yml`
 - OpenClaw Telegram `apiRoot`: `http://127.0.0.1:8082`
+
+## Быстрый старт
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.example.yml --env-file .env up -d telegram-bot-api
+npm run check
+ENABLE_CLOUD_FALLBACK=1 node src/telegram-bot-api-proxy.mjs
+```
+
+Для постоянного запуска proxy используется user systemd unit:
+
+```text
+systemd/openclaw-telegram-api-proxy.service.example
+```
 
 ## Переменные окружения
 
@@ -76,22 +90,8 @@ telegram/update-offset-syncopia-guest-bot.json
 
 В файлах нужны `botId` и `lastUpdateId`.
 
-## Запуск
+## Документация
 
-Проверка синтаксиса:
-
-```bash
-npm run check
-```
-
-Локальный запуск:
-
-```bash
-ENABLE_CLOUD_FALLBACK=1 node src/telegram-bot-api-proxy.mjs
-```
-
-User systemd unit:
-
-```text
-systemd/openclaw-telegram-api-proxy.service.example
-```
+- [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) - архитектурный план.
+- [docs/token-migration.md](docs/token-migration.md) - переезд token между cloud/local/local.
+- [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, offset-файлов и логов.
