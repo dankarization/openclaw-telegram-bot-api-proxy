@@ -32,6 +32,10 @@ const localUnhealthyCooldownMs = Number.parseInt(process.env.LOCAL_UNHEALTHY_COO
 const localHealthTimeoutMs = Number.parseInt(process.env.LOCAL_HEALTH_TIMEOUT_MS || "2000", 10);
 // Общий таймаут запроса к upstream API.
 const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || "130000", 10);
+// TTL проверки cloud pending updates, чтобы не дергать getWebhookInfo на каждом long poll.
+const cloudPendingProbeTtlMs = Number.parseInt(process.env.CLOUD_PENDING_PROBE_TTL_MS || "5000", 10);
+// Максимальный возраст cloud update, который можно виртуально поднять над local offset.
+const cloudFreshUpdateMaxAgeMs = Number.parseInt(process.env.CLOUD_FRESH_UPDATE_MAX_AGE_MS || String(6 * 60 * 60 * 1000), 10);
 
 // Момент, до которого local API считается здоровым без повторной проверки.
 let localHealthyUntil = 0;
@@ -43,6 +47,10 @@ let lastHealthLogState = "";
 const cloudUpdateStateByBotId = new Map();
 // Кэш file_path -> file_size из getFile, чтобы решать, можно ли фолбечить /file.
 const fileInfoByBotIdAndPath = new Map();
+// Кэш pending_update_count из cloud getWebhookInfo по каждому botId.
+const cloudPendingProbeByBotId = new Map();
+// Последний ack старых local update_id, чтобы не долбить локальный Bot API одинаковым offset.
+const localDroppedAckByBotId = new Map();
 
 // Убираем завершающие слэши у root URL, чтобы дальше безопасно склеивать root + req.url.
 function trimRoot(value) {
@@ -190,6 +198,29 @@ function numericOffset(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+// Ищем timestamp update в основных типах Telegram update, чтобы не оживлять совсем старые cloud сообщения.
+function updateDateMs(update) {
+  const seconds = numericOffset(
+    update?.message?.date
+      ?? update?.edited_message?.date
+      ?? update?.channel_post?.date
+      ?? update?.edited_channel_post?.date
+      ?? update?.callback_query?.message?.date
+      ?? update?.my_chat_member?.date
+      ?? update?.chat_member?.date
+      ?? update?.chat_join_request?.date
+      ?? null,
+  );
+  return seconds == null ? null : seconds * 1000;
+}
+
+// Cloud fallback может поднимать только свежие updates; без даты считаем update допустимым.
+function isFreshCloudUpdate(update) {
+  const dateMs = updateDateMs(update);
+  if (dateMs == null) return true;
+  return Date.now() - dateMs <= cloudFreshUpdateMaxAgeMs;
+}
+
 function requestOffsetValue(req, body) {
   const url = new URL(req.url || "/", "http://proxy.local");
   const queryOffset = numericOffset(url.searchParams.get("offset"));
@@ -266,6 +297,33 @@ function bodyWithOffset(req, body, offset) {
   return { reqUrl: `${url.pathname}${url.search}`, body };
 }
 
+// Для служебного ack local getUpdates ставим timeout=0, чтобы не ждать long polling.
+function bodyWithOffsetAndTimeout(req, body, offset, timeoutValue) {
+  const type = String(req.headers["content-type"] || "").toLowerCase();
+  if (body?.length && type.includes("application/json")) {
+    try {
+      const payload = JSON.parse(body.toString("utf8"));
+      return {
+        reqUrl: req.url,
+        body: Buffer.from(JSON.stringify({ ...payload, offset, timeout: timeoutValue })),
+      };
+    } catch {
+      // Если JSON не разобрался, попробуем перенести offset и timeout в query string.
+    }
+  }
+  if (body?.length && type.includes("x-www-form-urlencoded")) {
+    const form = new URLSearchParams(body.toString("utf8"));
+    form.set("offset", String(offset));
+    form.set("timeout", String(timeoutValue));
+    return { reqUrl: req.url, body: Buffer.from(form.toString()) };
+  }
+
+  const url = new URL(req.url || "/", "http://proxy.local");
+  url.searchParams.set("offset", String(offset));
+  url.searchParams.set("timeout", String(timeoutValue));
+  return { reqUrl: `${url.pathname}${url.search}`, body };
+}
+
 function cloudRequestForGetUpdates(req, method, token, body) {
   if (method !== "getUpdates") return { reqUrl: req.url, body, translated: false };
   const botId = botIdFromToken(token);
@@ -296,7 +354,7 @@ function jsonCloudResponse(upstream, payload) {
   };
 }
 
-function guardedCloudGetUpdates(req, method, token, body, upstream) {
+function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}) {
   if (method !== "getUpdates" || upstream.statusCode !== 200 || !upstream.body?.length) {
     return { upstream, dropped: 0, floor: null, translated: false };
   }
@@ -314,6 +372,41 @@ function guardedCloudGetUpdates(req, method, token, body, upstream) {
     if (!state && payload.result.length === 0 && botId && localFloor != null) {
       cloudUpdateStateByBotId.set(botId, { cloudFloor: null, virtualFloor: localFloor });
       return { upstream, dropped: 0, floor: localFloor, translated: false };
+    }
+
+    // Когда local API здоров, но пуст, а cloud держит свежие updates с меньшими id,
+    // виртуально переносим cloud id выше local offset, чтобы OpenClaw не откатил cursor.
+    if (!state && options.virtualizeLowerIds && botId && localFloor != null && maxCloudUpdateId != null) {
+      const fresh = payload.result.filter(isFreshCloudUpdate);
+      const freshUpdateIds = fresh.map((update) => numericOffset(update?.update_id)).filter((id) => id != null);
+      if (freshUpdateIds.length === 0) {
+        cloudUpdateStateByBotId.set(botId, { cloudFloor: maxCloudUpdateId, virtualFloor: localFloor });
+        return {
+          upstream: jsonCloudResponse(upstream, { ...payload, result: [] }),
+          dropped: payload.result.length,
+          floor: localFloor,
+          translated: true,
+        };
+      }
+
+      const cloudBase = Math.min(...freshUpdateIds) - 1;
+      const virtualBase = localFloor;
+      let nextCloudFloor = cloudBase;
+      let nextVirtualFloor = virtualBase;
+      const result = fresh.map((update) => {
+        const cloudUpdateId = numericOffset(update?.update_id);
+        const virtualUpdateId = virtualBase + (cloudUpdateId - cloudBase);
+        nextCloudFloor = Math.max(nextCloudFloor, cloudUpdateId);
+        nextVirtualFloor = Math.max(nextVirtualFloor, virtualUpdateId);
+        return { ...update, update_id: virtualUpdateId };
+      });
+      cloudUpdateStateByBotId.set(botId, { cloudFloor: nextCloudFloor, virtualFloor: nextVirtualFloor });
+      return {
+        upstream: jsonCloudResponse(upstream, { ...payload, result }),
+        dropped: payload.result.length - result.length,
+        floor: localFloor,
+        translated: true,
+      };
     }
 
     if (!state && localFloor != null && maxCloudUpdateId != null && maxCloudUpdateId <= localFloor) {
@@ -366,6 +459,90 @@ function guardedCloudGetUpdates(req, method, token, body, upstream) {
   } catch {
     return { upstream, dropped: 0, floor: null, translated: false };
   }
+}
+
+// Проверяем, что local getUpdates ответил штатно, но без новых сообщений.
+function emptySuccessfulGetUpdates(method, upstream) {
+  if (method !== "getUpdates" || upstream.statusCode !== 200 || !upstream.body?.length) return false;
+  try {
+    const payload = JSON.parse(upstream.body.toString("utf8"));
+    return Boolean(payload?.ok && Array.isArray(payload.result) && payload.result.length === 0);
+  } catch {
+    return false;
+  }
+}
+
+// Отбрасываем local updates ниже сохраненного OpenClaw offset, чтобы Docker Bot API не оживлял старые сессии.
+function guardedLocalGetUpdates(req, method, token, body, upstream) {
+  if (method !== "getUpdates" || upstream.statusCode !== 200 || !upstream.body?.length) {
+    return { upstream, dropped: 0, floor: null, ackOffset: null };
+  }
+  try {
+    const payload = JSON.parse(upstream.body.toString("utf8"));
+    if (!payload?.ok || !Array.isArray(payload.result)) return { upstream, dropped: 0, floor: null, ackOffset: null };
+    const floor = localOffsetFloor(req, token, body);
+    if (floor == null) return { upstream, dropped: 0, floor: null, ackOffset: null };
+    let maxDroppedUpdateId = null;
+    const result = payload.result.filter((update) => {
+      const updateId = numericOffset(update?.update_id);
+      if (updateId == null || updateId > floor) return true;
+      maxDroppedUpdateId = Math.max(maxDroppedUpdateId ?? updateId, updateId);
+      return false;
+    });
+    const dropped = payload.result.length - result.length;
+    return {
+      upstream: dropped > 0 ? jsonCloudResponse(upstream, { ...payload, result }) : upstream,
+      dropped,
+      floor,
+      ackOffset: maxDroppedUpdateId == null ? null : maxDroppedUpdateId + 1,
+    };
+  } catch {
+    return { upstream, dropped: 0, floor: null, ackOffset: null };
+  }
+}
+
+// Подтверждаем local Bot API, что старые update_id можно пропустить, иначе он будет возвращать их снова.
+async function acknowledgeDroppedLocalUpdates(req, token, body, ackOffset) {
+  if (ackOffset == null) return;
+  const botId = botIdFromToken(token);
+  if (!botId) return;
+  const now = Date.now();
+  const cached = localDroppedAckByBotId.get(botId);
+  if (cached && cached.offset === ackOffset && now - cached.sentAt < 2000) return;
+  localDroppedAckByBotId.set(botId, { offset: ackOffset, sentAt: now });
+  const ackRequest = bodyWithOffsetAndTimeout(req, body, ackOffset, 0);
+  try {
+    await forwardBuffered(req, localRoot, ackRequest.body, ackRequest.reqUrl);
+    log(`method=getUpdates target=local action=ack-dropped offset=${ackOffset}`);
+  } catch (error) {
+    logError(`method=getUpdates target=local action=ack-dropped error=${error?.code || error?.name || "unknown"} message=${error?.message || String(error)}`);
+  }
+}
+
+// Для getUpdates fallback проверяем cloud backlog отдельно: local API может быть здоровым, но пустым.
+async function probeCloudPendingUpdates(token) {
+  const botId = botIdFromToken(token);
+  if (!botId) return { pending: 0, cached: false };
+  const now = Date.now();
+  const cached = cloudPendingProbeByBotId.get(botId);
+  if (cached && now - cached.checkedAt < cloudPendingProbeTtlMs) {
+    return { pending: cached.pending, cached: true };
+  }
+
+  const raw = await forwardBuffered(
+    { method: "GET", headers: {}, url: `/bot${token}/getWebhookInfo` },
+    cloudRoot,
+    Buffer.alloc(0),
+  );
+  let pending = 0;
+  try {
+    const payload = JSON.parse(raw.body.toString("utf8"));
+    pending = numericOffset(payload?.result?.pending_update_count) ?? 0;
+  } catch {
+    pending = 0;
+  }
+  cloudPendingProbeByBotId.set(botId, { pending, checkedAt: now });
+  return { pending, cached: false };
 }
 
 function isClearlyLocalUnavailable(error) {
@@ -536,7 +713,10 @@ async function handleBuffered(req, res, method, token, startedAt) {
 
   try {
     const localRaw = await forwardBuffered(req, localRoot, body);
-    const local = processGetFileResult(method, token, localRaw, "local");
+    const localProcessed = processGetFileResult(method, token, localRaw, "local");
+    const localGuard = guardedLocalGetUpdates(req, method, token, body, localProcessed);
+    const local = localGuard.upstream;
+    if (localGuard.dropped > 0) await acknowledgeDroppedLocalUpdates(req, token, body, localGuard.ackOffset);
     if (cloudFallbackAllowed && (local.statusCode === 401 || local.statusCode === 404) && body.length <= bufferLimitBytes) {
       const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
@@ -557,8 +737,21 @@ async function handleBuffered(req, res, method, token, startedAt) {
       log(`method=${method} target=cloud reason=local-${local.statusCode} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
+    if (cloudFallbackAllowed && emptySuccessfulGetUpdates(method, local)) {
+      const pendingProbe = await probeCloudPendingUpdates(token);
+      if (pendingProbe.pending > 0) {
+        const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
+        const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
+        const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
+        const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed, { virtualizeLowerIds: true });
+        const cloud = cloudResult.upstream;
+        writeBufferedResponse(res, cloud);
+        log(`method=${method} target=cloud reason=local-empty-cloud-pending pending=${pendingProbe.pending} cached=${pendingProbe.cached ? "yes" : "no"} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
+        return;
+      }
+    }
     writeBufferedResponse(res, local);
-    log(`method=${method} target=local status=${local.statusCode} ms=${Date.now() - startedAt}`);
+    log(`method=${method} target=local status=${local.statusCode}${localGuard.dropped ? ` dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"}` : ""} ms=${Date.now() - startedAt}`);
   } catch (error) {
     if (cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
       markLocalUnhealthy(error.code);

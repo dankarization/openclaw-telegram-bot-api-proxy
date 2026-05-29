@@ -18,12 +18,14 @@ OpenClaw
 ## Поведение
 
 - Локальный Bot API всегда в приоритете.
-- Cloud fallback включается только при ошибке local API и только для безопасных
-  методов.
+- Cloud fallback включается при ошибке local API или когда local `getUpdates`
+  пустой, но в cloud есть свежие pending updates.
 - `getUpdates` защищён от старых cloud updates:
   - proxy читает локальный OpenClaw offset;
   - ведёт отдельный cloud cursor;
   - при необходимости поднимает cloud `update_id` выше локального offset.
+- Старые local updates ниже OpenClaw offset отбрасываются и подтверждаются в
+  local Bot API, чтобы они не возвращались снова.
 - `/file/...` уходит в cloud только если размер известен из `getFile` и не
   больше `CLOUD_FILE_FALLBACK_MAX_BYTES`.
 - Файлы неизвестного размера и тяжёлые файлы остаются только на local API.
@@ -52,6 +54,8 @@ OpenClaw
 | `LOCAL_UNHEALTHY_COOLDOWN_MS` | `5000` | Пауза после ошибки local API. |
 | `LOCAL_HEALTH_TIMEOUT_MS` | `2000` | Таймаут health-check через `getMe`. |
 | `UPSTREAM_TIMEOUT_MS` | `130000` | Таймаут upstream-запроса. |
+| `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |
+| `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
 
 ## OpenClaw
 

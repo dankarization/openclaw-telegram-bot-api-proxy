@@ -22,6 +22,8 @@ Environment=LOCAL_HEALTH_TTL_MS=5000
 Environment=LOCAL_UNHEALTHY_COOLDOWN_MS=5000
 Environment=LOCAL_HEALTH_TIMEOUT_MS=2000
 Environment=UPSTREAM_TIMEOUT_MS=130000
+Environment=CLOUD_PENDING_PROBE_TTL_MS=5000
+Environment=CLOUD_FRESH_UPDATE_MAX_AGE_MS=21600000
 ExecStart=/usr/bin/node %h/.openclaw/bin/telegram-bot-api-proxy.mjs
 Restart=always
 RestartSec=3
