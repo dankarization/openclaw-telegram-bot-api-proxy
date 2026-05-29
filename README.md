@@ -1,55 +1,59 @@
 # OpenClaw Telegram Bot API Proxy
 
-Proxy для Telegram Bot API в OpenClaw с приоритетом локального сервера.
+Локальный proxy для Telegram Bot API в OpenClaw.
 
-Он нужен для схемы, где основной канал работает через локальный
-`telegram-bot-api` и умеет принимать тяжёлые файлы, но при падении локального
-сервера связь с ботом не должна пропадать полностью. В аварийном режиме proxy
-переключает безопасные запросы на облачный `api.telegram.org`, а тяжёлые файлы
-оставляет на локальном сервере.
+Рабочая схема:
+
+```text
+OpenClaw
+  -> http://127.0.0.1:8082
+  -> openclaw-telegram-api-proxy
+  -> http://127.0.0.1:8081
+  -> Docker aiogram/telegram-bot-api:latest --local
+```
+
+Если локальный Bot API недоступен, proxy может отправить безопасные запросы в
+`https://api.telegram.org`, чтобы связь с ботом не пропала полностью.
 
 ## Поведение
 
-- Сначала отправляет запросы OpenClaw в локальный Telegram Bot API.
-- При недоступности local API или выбранных безопасных ошибках использует
-  Telegram cloud API.
-- Защищает fallback для `getUpdates`: учитывает локальный offset и отдельный
-  cloud cursor, чтобы старые облачные updates не откатывали offset OpenClaw.
-- При необходимости переписывает cloud `update_id` в виртуальный монотонный
-  диапазон выше локального offset.
-- Разрешает cloud fallback для `/file/...` только когда размер файла уже известен
-  из ответа `getFile` и не превышает `CLOUD_FILE_FALLBACK_MAX_BYTES`.
-- Файлы неизвестного размера и большие файлы оставляет только на local API.
+- Локальный Bot API всегда в приоритете.
+- Cloud fallback включается только при ошибке local API и только для безопасных
+  методов.
+- `getUpdates` защищён от старых cloud updates:
+  - proxy читает локальный OpenClaw offset;
+  - ведёт отдельный cloud cursor;
+  - при необходимости поднимает cloud `update_id` выше локального offset.
+- `/file/...` уходит в cloud только если размер известен из `getFile` и не
+  больше `CLOUD_FILE_FALLBACK_MAX_BYTES`.
+- Файлы неизвестного размера и тяжёлые файлы остаются только на local API.
 
 ## Требования
 
 - Node.js 22+
-- Локальный Telegram Bot API server, например
-  `aiogram/telegram-bot-api:latest`
-- OpenClaw, настроенный использовать этот proxy как Telegram `apiRoot`
+- Docker-контейнер `aiogram/telegram-bot-api:latest` на `127.0.0.1:8081`
+- OpenClaw Telegram `apiRoot`: `http://127.0.0.1:8082`
 
-## Конфигурация
+## Переменные окружения
 
-Переменные окружения:
-
-| Переменная | По умолчанию | Описание |
+| Переменная | Значение по умолчанию | Назначение |
 | --- | --- | --- |
-| `LISTEN_HOST` | `127.0.0.1` | Хост, на котором слушает proxy. |
+| `LISTEN_HOST` | `127.0.0.1` | Хост proxy. |
 | `PORT` | `8082` | Порт proxy. |
-| `LOCAL_API_ROOT` | `http://127.0.0.1:8081` | Адрес локального Bot API. |
-| `CLOUD_API_ROOT` | `https://api.telegram.org` | Адрес Telegram cloud API. |
-| `ENABLE_CLOUD_FALLBACK` | `false` | Включает fallback в cloud. |
-| `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог с OpenClaw update-offset файлами. |
-| `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Максимальный известный размер файла для cloud `/file/...` fallback. |
-| `BUFFER_LIMIT_BYTES` | `8388608` | Максимальный размер буферизуемого API-запроса. |
+| `LOCAL_API_ROOT` | `http://127.0.0.1:8081` | Локальный Docker Bot API. |
+| `CLOUD_API_ROOT` | `https://api.telegram.org` | Cloud Bot API. |
+| `ENABLE_CLOUD_FALLBACK` | `false` | Включить cloud fallback. |
+| `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог OpenClaw offset-файлов. |
+| `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
+| `BUFFER_LIMIT_BYTES` | `8388608` | Лимит буферизации API-запроса. |
 | `LOCAL_HEALTH_TTL_MS` | `5000` | TTL успешной проверки local API. |
-| `LOCAL_UNHEALTHY_COOLDOWN_MS` | `5000` | Пауза перед новой проверкой local API после ошибки. |
-| `LOCAL_HEALTH_TIMEOUT_MS` | `2000` | Таймаут local health-check через `getMe`. |
-| `UPSTREAM_TIMEOUT_MS` | `130000` | Таймаут запроса к upstream API. |
+| `LOCAL_UNHEALTHY_COOLDOWN_MS` | `5000` | Пауза после ошибки local API. |
+| `LOCAL_HEALTH_TIMEOUT_MS` | `2000` | Таймаут health-check через `getMe`. |
+| `UPSTREAM_TIMEOUT_MS` | `130000` | Таймаут upstream-запроса. |
 
-## Настройка OpenClaw
+## OpenClaw
 
-Укажите proxy как `apiRoot` Telegram-аккаунта:
+В `openclaw.json` Telegram-аккаунт должен смотреть на proxy:
 
 ```json
 {
@@ -57,23 +61,31 @@ Proxy для Telegram Bot API в OpenClaw с приоритетом локаль
 }
 ```
 
-Proxy читает OpenClaw offset-файлы такого вида:
+Proxy использует offset-файлы OpenClaw:
 
 ```text
 telegram/update-offset-default.json
 telegram/update-offset-syncopia-guest-bot.json
 ```
 
-В каждом файле должны быть `botId` и `lastUpdateId`.
+В файлах нужны `botId` и `lastUpdateId`.
 
-## Локальная разработка
+## Запуск
+
+Проверка синтаксиса:
 
 ```bash
 npm run check
+```
+
+Локальный запуск:
+
+```bash
 ENABLE_CLOUD_FALLBACK=1 node src/telegram-bot-api-proxy.mjs
 ```
 
-## systemd
+User systemd unit:
 
-Пример user-unit лежит в
-`systemd/openclaw-telegram-api-proxy.service.example`.
+```text
+systemd/openclaw-telegram-api-proxy.service.example
+```
