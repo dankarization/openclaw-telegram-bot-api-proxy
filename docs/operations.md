@@ -84,7 +84,7 @@ curl -sS "$PROXY_API/bot$BOT_TOKEN/getFile?file_id=$FILE_ID"
 
 ```text
 LOCAL_FILE_PATH_REWRITE_FROM=/var/lib/telegram-bot-api
-LOCAL_FILE_PATH_REWRITE_TO=/home/danka/.openclaw/var/telegram-bot-api
+LOCAL_FILE_PATH_REWRITE_TO=./var/telegram-bot-api
 ```
 
 `/file/...` уходит в cloud только для файлов с известным размером не больше `CLOUD_FILE_FALLBACK_MAX_BYTES`. Большие файлы и неизвестный размер остаются local-only.
