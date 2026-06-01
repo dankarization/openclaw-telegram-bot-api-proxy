@@ -32,6 +32,19 @@ const localUnhealthyCooldownMs = Number.parseInt(process.env.LOCAL_UNHEALTHY_COO
 const localHealthTimeoutMs = Number.parseInt(process.env.LOCAL_HEALTH_TIMEOUT_MS || "2000", 10);
 // Общий таймаут запроса к upstream API.
 const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || "130000", 10);
+// Разрешает аварийный cloud fallback именно для getUpdates после local retry.
+const cloudGetUpdatesFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_GETUPDATES_FALLBACK, true);
+// Максимальная длительность local getUpdates long poll в секундах; 0 превращает polling в short poll.
+const localGetUpdatesTimeoutSeconds = parseNonNegativeInteger(process.env.LOCAL_GETUPDATES_TIMEOUT_SECONDS, 10);
+// Количество попыток local getUpdates перед тем, как отдать ошибку или уйти в cloud fallback.
+const localGetUpdatesMaxAttempts = parsePositiveInteger(process.env.LOCAL_GETUPDATES_MAX_ATTEMPTS, 4);
+// Базовая пауза между retry local getUpdates. Пауза растет экспоненциально.
+const localGetUpdatesRetryBaseMs = parseNonNegativeInteger(process.env.LOCAL_GETUPDATES_RETRY_BASE_MS, 300);
+// Отдельный сетевой timeout для local getUpdates, чтобы оборванный long poll не висел по общему upstream timeout.
+const localGetUpdatesUpstreamTimeoutMs = parsePositiveInteger(
+  process.env.LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS,
+  Math.max(5000, (localGetUpdatesTimeoutSeconds + 5) * 1000),
+);
 // TTL проверки cloud pending updates, чтобы не дергать getWebhookInfo на каждом long poll.
 const cloudPendingProbeTtlMs = Number.parseInt(process.env.CLOUD_PENDING_PROBE_TTL_MS || "5000", 10);
 // Максимальный возраст cloud update, который можно виртуально поднять над local offset.
@@ -106,6 +119,16 @@ function rewriteLocalFilePath(filePath) {
 function parseBoolean(value, fallback) {
   if (value == null || value === "") return fallback;
   return /^(1|true|yes|on)$/iu.test(String(value).trim());
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 // Маскируем Telegram bot token в любых лог-строках, включая неожиданные тексты ошибок.
@@ -214,6 +237,9 @@ function isMultipartUploadRequest(req) {
 
 function cloudFallbackPolicy(method, token, pathname = "", req = null) {
   if (!cloudFallbackEnabled) return { allowed: false, reason: "fallback-disabled" };
+  if (method === "getUpdates" && !cloudGetUpdatesFallbackEnabled) {
+    return { allowed: false, reason: "cloud-getupdates-fallback-disabled" };
+  }
   if (localOnlyMethods.has(method)) return { allowed: false, reason: "local-only-method" };
   if (req && isMultipartUploadRequest(req)) return { allowed: false, reason: "multipart-upload-local-only" };
 
@@ -341,6 +367,30 @@ function bodyWithOffset(req, body, offset) {
   return { reqUrl: `${url.pathname}${url.search}`, body };
 }
 
+function bodyWithTimeout(req, body, timeoutValue) {
+  const type = String(req.headers["content-type"] || "").toLowerCase();
+  if (body?.length && type.includes("application/json")) {
+    try {
+      const payload = JSON.parse(body.toString("utf8"));
+      return {
+        reqUrl: req.url,
+        body: Buffer.from(JSON.stringify({ ...payload, timeout: timeoutValue })),
+      };
+    } catch {
+      // Если JSON не разобрался, попробуем перенести timeout в query string.
+    }
+  }
+  if (body?.length && type.includes("x-www-form-urlencoded")) {
+    const form = new URLSearchParams(body.toString("utf8"));
+    form.set("timeout", String(timeoutValue));
+    return { reqUrl: req.url, body: Buffer.from(form.toString()) };
+  }
+
+  const url = new URL(req.url || "/", "http://proxy.local");
+  url.searchParams.set("timeout", String(timeoutValue));
+  return { reqUrl: `${url.pathname}${url.search}`, body };
+}
+
 // Для служебного ack local getUpdates ставим timeout=0, чтобы не ждать long polling.
 function bodyWithOffsetAndTimeout(req, body, offset, timeoutValue) {
   const type = String(req.headers["content-type"] || "").toLowerCase();
@@ -366,6 +416,52 @@ function bodyWithOffsetAndTimeout(req, body, offset, timeoutValue) {
   url.searchParams.set("offset", String(offset));
   url.searchParams.set("timeout", String(timeoutValue));
   return { reqUrl: `${url.pathname}${url.search}`, body };
+}
+
+function requestTimeoutValue(req, body) {
+  const url = new URL(req.url || "/", "http://proxy.local");
+  const queryTimeout = numericOffset(url.searchParams.get("timeout"));
+  if (queryTimeout != null) return queryTimeout;
+
+  if (!body?.length) return null;
+  const type = String(req.headers["content-type"] || "").toLowerCase();
+  try {
+    if (type.includes("application/json")) {
+      const payload = JSON.parse(body.toString("utf8"));
+      return numericOffset(payload?.timeout);
+    }
+    if (type.includes("x-www-form-urlencoded")) {
+      const form = new URLSearchParams(body.toString("utf8"));
+      return numericOffset(form.get("timeout"));
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function requestWithUrl(req, reqUrl) {
+  if (reqUrl === req.url) return req;
+  return {
+    method: req.method,
+    headers: req.headers,
+    url: reqUrl,
+  };
+}
+
+function applyGetUpdatesTimeoutCap(req, method, body) {
+  if (method !== "getUpdates") return { req, body, capped: false, timeout: null };
+  const currentTimeout = requestTimeoutValue(req, body);
+  if (currentTimeout != null && currentTimeout <= localGetUpdatesTimeoutSeconds) {
+    return { req, body, capped: false, timeout: currentTimeout };
+  }
+  const updated = bodyWithTimeout(req, body, localGetUpdatesTimeoutSeconds);
+  return {
+    req: requestWithUrl(req, updated.reqUrl),
+    body: updated.body,
+    capped: currentTimeout !== localGetUpdatesTimeoutSeconds,
+    timeout: localGetUpdatesTimeoutSeconds,
+  };
 }
 
 function cloudRequestForGetUpdates(req, method, token, body) {
@@ -562,7 +658,7 @@ async function acknowledgeDroppedLocalUpdates(req, token, body, ackOffset) {
     await forwardBuffered(req, localRoot, ackRequest.body, ackRequest.reqUrl);
     log(`method=getUpdates target=local action=ack-dropped offset=${ackOffset}`);
   } catch (error) {
-    logError(`method=getUpdates target=local action=ack-dropped error=${error?.code || error?.name || "unknown"} message=${error?.message || String(error)}`);
+    logError(`method=getUpdates target=local action=ack-dropped ${errorLogFields(error)}`);
   }
 }
 
@@ -594,8 +690,51 @@ async function probeCloudPendingUpdates(token) {
   return { pending, cached: false };
 }
 
+function errorChain(error) {
+  const chain = [];
+  let current = error;
+  let guard = 0;
+  while (current && guard < 5) {
+    chain.push(current);
+    current = current.cause;
+    guard += 1;
+  }
+  return chain;
+}
+
+function errorReason(error) {
+  for (const item of errorChain(error)) {
+    const code = String(item?.code || "").toUpperCase();
+    if (code) return code;
+  }
+  for (const item of errorChain(error)) {
+    const name = String(item?.name || "");
+    if (name) return name;
+  }
+  return "unknown";
+}
+
+function errorCauseReason(error) {
+  return error?.cause ? errorReason(error.cause) : "none";
+}
+
+function errorMessage(error) {
+  return String(error?.message || error?.cause?.message || error || "unknown").replace(/\s+/gu, " ").slice(0, 220);
+}
+
+function errorLogFields(error) {
+  return `reason=${errorReason(error)} cause=${errorCauseReason(error)} message=${JSON.stringify(errorMessage(error))}`;
+}
+
 function isClearlyLocalUnavailable(error) {
-  return ["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND"].includes(error?.code);
+  const codes = errorChain(error).map((item) => String(item?.code || "").toUpperCase()).filter(Boolean);
+  if (codes.some((code) => ["ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "ETIMEDOUT", "UND_ERR_SOCKET"].includes(code))) {
+    return true;
+  }
+  const names = errorChain(error).map((item) => String(item?.name || "").toLowerCase()).filter(Boolean);
+  if (names.some((name) => ["aborterror", "timeouterror"].includes(name))) return true;
+  const message = errorChain(error).map((item) => `${item?.message || ""}`).join(" ").toLowerCase();
+  return /\b(fetch failed|network request failed|socket hang up|connection reset|connection refused|network is unreachable|host is unreachable|timeout|timed out|aborted)\b/u.test(message);
 }
 
 function markLocalUnhealthy(reason) {
@@ -633,7 +772,8 @@ async function checkLocalHealth(token) {
     markLocalHealthy();
     return true;
   } catch (error) {
-    markLocalUnhealthy(error?.code || error?.name || "healthcheck-failed");
+    markLocalUnhealthy(errorReason(error));
+    log(`method=getMe target=local action=healthcheck-failed ${errorLogFields(error)}`);
     return false;
   } finally {
     clearTimeout(timeout);
@@ -698,10 +838,19 @@ async function readRequestBody(req) {
   return Buffer.concat(chunks);
 }
 
-async function forwardBuffered(req, root, body, reqUrl = req.url) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getUpdatesRetryDelayMs(attempt) {
+  return localGetUpdatesRetryBaseMs * (2 ** Math.max(0, attempt - 1));
+}
+
+async function forwardBuffered(req, root, body, reqUrl = req.url, options = {}) {
   const url = `${root}${reqUrl}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+  const timeoutMs = options.timeoutMs ?? upstreamTimeoutMs;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   timeout.unref?.();
   try {
     const headers = copyHeaders(req.headers);
@@ -722,6 +871,55 @@ async function forwardBuffered(req, root, body, reqUrl = req.url) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function forwardLocalBuffered(req, method, body) {
+  if (method !== "getUpdates") {
+    return { upstream: await forwardBuffered(req, localRoot, body), req, body, attempts: 1, timeoutCapped: false, timeout: null };
+  }
+
+  const localRequest = applyGetUpdatesTimeoutCap(req, method, body);
+  let lastHttpUpstream = null;
+  for (let attempt = 1; attempt <= localGetUpdatesMaxAttempts; attempt += 1) {
+    try {
+      const upstream = await forwardBuffered(
+        localRequest.req,
+        localRoot,
+        localRequest.body,
+        localRequest.req.url,
+        { timeoutMs: localGetUpdatesUpstreamTimeoutMs },
+      );
+      if (upstream.statusCode < 500 || attempt >= localGetUpdatesMaxAttempts) {
+        if (upstream.statusCode < 500) markLocalHealthy();
+        return {
+          upstream,
+          req: localRequest.req,
+          body: localRequest.body,
+          attempts: attempt,
+          timeoutCapped: localRequest.capped,
+          timeout: localRequest.timeout,
+        };
+      }
+      lastHttpUpstream = upstream;
+      const waitMs = getUpdatesRetryDelayMs(attempt);
+      log(`method=getUpdates target=local action=retry attempt=${attempt} status=${upstream.statusCode} waitMs=${waitMs} timeout=${localRequest.timeout ?? "none"}`);
+      await sleep(waitMs);
+    } catch (error) {
+      if (!isClearlyLocalUnavailable(error) || attempt >= localGetUpdatesMaxAttempts) throw error;
+      const waitMs = getUpdatesRetryDelayMs(attempt);
+      log(`method=getUpdates target=local action=retry attempt=${attempt} ${errorLogFields(error)} waitMs=${waitMs} timeout=${localRequest.timeout ?? "none"}`);
+      await sleep(waitMs);
+    }
+  }
+
+  return {
+    upstream: lastHttpUpstream,
+    req: localRequest.req,
+    body: localRequest.body,
+    attempts: localGetUpdatesMaxAttempts,
+    timeoutCapped: localRequest.capped,
+    timeout: localRequest.timeout,
+  };
 }
 
 function writeBufferedResponse(res, upstream) {
@@ -770,7 +968,7 @@ async function handleBuffered(req, res, method, token, startedAt) {
   const localIsHealthy = await checkLocalHealth(token);
   const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
   const cloudFallbackAllowed = cloudFallback.allowed;
-  if (!localIsHealthy && cloudFallbackAllowed) {
+  if (method !== "getUpdates" && !localIsHealthy && cloudFallbackAllowed) {
     const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
     const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
     const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
@@ -782,41 +980,52 @@ async function handleBuffered(req, res, method, token, startedAt) {
   }
 
   try {
-    const localRaw = await forwardBuffered(req, localRoot, body);
+    const localAttempt = await forwardLocalBuffered(req, method, body);
+    const localReq = localAttempt.req;
+    const localBody = localAttempt.body;
+    const localRaw = localAttempt.upstream;
     const localProcessed = processGetFileResult(method, token, localRaw, "local");
-    const localGuard = guardedLocalGetUpdates(req, method, token, body, localProcessed);
+    const localGuard = guardedLocalGetUpdates(localReq, method, token, localBody, localProcessed);
     const local = localGuard.upstream;
     if (localGuard.dropped > 0) {
       log(`method=getUpdates target=local action=dropped-local-update dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"} ackOffset=${localGuard.ackOffset ?? "none"}`);
-      await acknowledgeDroppedLocalUpdates(req, token, body, localGuard.ackOffset);
+      await acknowledgeDroppedLocalUpdates(localReq, token, localBody, localGuard.ackOffset);
     }
     if (cloudFallbackAllowed && (local.statusCode === 401 || local.statusCode === 404) && body.length <= bufferLimitBytes) {
-      const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
+      const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
       const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
-      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
+      const cloudResult = guardedCloudGetUpdates(localReq, method, token, localBody, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
       log(`method=${method} target=cloud reason=local-${local.statusCode} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
     if (cloudFallbackAllowed && local.statusCode >= 500 && isSafeMethodForStatusFallback(method)) {
-      const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
+      const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
       const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
-      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
+      const cloudResult = guardedCloudGetUpdates(localReq, method, token, localBody, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
-      log(`method=${method} target=cloud reason=local-${local.statusCode} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
+      log(`method=${method} target=cloud reason=local-${local.statusCode} localAttempts=${localAttempt.attempts} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
-    if (cloudFallbackAllowed && emptySuccessfulGetUpdates(method, local)) {
-      const pendingProbe = await probeCloudPendingUpdates(token);
+    if (cloudFallbackAllowed && cloudGetUpdatesFallbackEnabled && emptySuccessfulGetUpdates(method, local)) {
+      let pendingProbe = null;
+      try {
+        pendingProbe = await probeCloudPendingUpdates(token);
+      } catch (error) {
+        writeBufferedResponse(res, local);
+        log(`method=getWebhookInfo target=cloud action=cloud-pending-probe-failed ${errorLogFields(error)}`);
+        log(`method=${method} target=local status=${local.statusCode}${localAttempt.attempts > 1 ? ` attempts=${localAttempt.attempts}` : ""}${localAttempt.timeoutCapped ? ` timeoutCapped=${localAttempt.timeout}` : ""} cloudProbe=failed ms=${Date.now() - startedAt}`);
+        return;
+      }
       if (pendingProbe.pending > 0) {
-        const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
+        const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
         const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
         const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
-        const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed, { virtualizeLowerIds: true });
+        const cloudResult = guardedCloudGetUpdates(localReq, method, token, localBody, cloudProcessed, { virtualizeLowerIds: true });
         const cloud = cloudResult.upstream;
         writeBufferedResponse(res, cloud);
         log(`method=${method} target=cloud reason=local-empty-cloud-pending pending=${pendingProbe.pending} cached=${pendingProbe.cached ? "yes" : "no"} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
@@ -824,22 +1033,23 @@ async function handleBuffered(req, res, method, token, startedAt) {
       }
     }
     writeBufferedResponse(res, local);
-    log(`method=${method} target=local status=${local.statusCode}${localGuard.dropped ? ` dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"}` : ""} ms=${Date.now() - startedAt}`);
+    log(`method=${method} target=local status=${local.statusCode}${localAttempt.attempts > 1 ? ` attempts=${localAttempt.attempts}` : ""}${localAttempt.timeoutCapped ? ` timeoutCapped=${localAttempt.timeout}` : ""}${localGuard.dropped ? ` dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"}` : ""} ms=${Date.now() - startedAt}`);
   } catch (error) {
     if (cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
-      markLocalUnhealthy(error.code);
-      const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
+      markLocalUnhealthy(errorReason(error));
+      const fallbackRequest = applyGetUpdatesTimeoutCap(req, method, body);
+      const cloudRequest = cloudRequestForGetUpdates(fallbackRequest.req, method, token, fallbackRequest.body);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
       const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
-      const cloudResult = guardedCloudGetUpdates(req, method, token, body, cloudProcessed);
+      const cloudResult = guardedCloudGetUpdates(fallbackRequest.req, method, token, fallbackRequest.body, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
-      log(`method=${method} target=cloud reason=${error.code} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
+      log(`method=${method} target=cloud ${errorLogFields(error)} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
     if (!cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
-      markLocalUnhealthy(error.code);
-      log(`method=${method} target=local action=fallback-blocked reason=${cloudFallback.reason} error=${error.code} ms=${Date.now() - startedAt}`);
+      markLocalUnhealthy(errorReason(error));
+      log(`method=${method} target=local action=fallback-blocked fallbackReason=${cloudFallback.reason} ${errorLogFields(error)} ms=${Date.now() - startedAt}`);
     }
     throw error;
   }
@@ -859,14 +1069,14 @@ async function handleStreaming(req, res, method, token, startedAt) {
     log(`method=${method} target=${initialTarget} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
   } catch (error) {
     if (cloudFallbackAllowed && initialTarget === "local" && isClearlyLocalUnavailable(error) && (req.method === "GET" || req.method === "HEAD")) {
-      markLocalUnhealthy(error.code);
+      markLocalUnhealthy(errorReason(error));
       const result = await forwardStreaming(req, res, cloudRoot);
-      log(`method=${method} target=cloud reason=${error.code} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
+      log(`method=${method} target=cloud ${errorLogFields(error)} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
       return;
     }
     if (!cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
-      markLocalUnhealthy(error.code);
-      log(`method=${method} target=local action=fallback-blocked reason=${cloudFallback.reason} stream=${streamKind} error=${error.code} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
+      markLocalUnhealthy(errorReason(error));
+      log(`method=${method} target=local action=fallback-blocked fallbackReason=${cloudFallback.reason} stream=${streamKind} ${errorLogFields(error)} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
     }
     throw error;
   } finally {
@@ -887,7 +1097,7 @@ const server = http.createServer(async (req, res) => {
       await handleStreaming(req, res, method, token, startedAt);
     }
   } catch (error) {
-    logError(`method=${method} error=${error?.code || error?.name || "unknown"} message=${error?.message || String(error)}`);
+    logError(`method=${method} ${errorLogFields(error)}`);
     if (!res.headersSent) {
       res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: false, description: "Telegram Bot API proxy upstream failure" }));
@@ -899,7 +1109,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudFileMaxBytes=${cloudFileFallbackMaxBytes}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} cloudFileMaxBytes=${cloudFileFallbackMaxBytes}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.

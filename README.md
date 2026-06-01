@@ -16,8 +16,13 @@ OpenClaw Gateway
 ## Поведение
 
 - Локальный Bot API всегда в приоритете.
-- Cloud fallback включается при ошибке local API или когда local `getUpdates`
-  пустой, но в cloud есть свежие pending updates.
+- Local `getUpdates` перед fallback ретраится несколько раз; краткий обрыв
+  HTTP-соединения не должен валить Telegram provider.
+- Длительность long poll для local `getUpdates` ограничивается
+  `LOCAL_GETUPDATES_TIMEOUT_SECONDS`; значение `0` отключает long poll и
+  превращает его в short polling.
+- Cloud fallback включается при ошибке local API после retry или когда local
+  `getUpdates` пустой, но в cloud есть свежие pending updates.
 - `getUpdates` защищён от старых cloud updates:
   - proxy читает локальный OpenClaw offset;
   - ведёт отдельный cloud cursor;
@@ -71,6 +76,11 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `LOCAL_UNHEALTHY_COOLDOWN_MS` | `5000` | Пауза после ошибки local API. |
 | `LOCAL_HEALTH_TIMEOUT_MS` | `2000` | Таймаут health-check через `getMe`. |
 | `UPSTREAM_TIMEOUT_MS` | `130000` | Таймаут upstream-запроса. |
+| `ENABLE_CLOUD_GETUPDATES_FALLBACK` | `true` | Разрешить cloud fallback для `getUpdates` после local retry. |
+| `LOCAL_GETUPDATES_TIMEOUT_SECONDS` | `10` | Максимальный `timeout` для local `getUpdates`; `0` отключает long poll. |
+| `LOCAL_GETUPDATES_MAX_ATTEMPTS` | `4` | Количество local-попыток `getUpdates` перед fallback/ошибкой. |
+| `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
+| `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |
 | `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
 

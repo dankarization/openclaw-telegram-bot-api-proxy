@@ -65,11 +65,14 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 
 - `target=local` - запрос ушел в локальный Bot API.
 - `target=cloud` - запрос ушел в cloud fallback.
+- `action=retry` - local `getUpdates` временно оборвался или вернул 5xx, proxy повторяет запрос перед fallback.
+- `timeoutCapped=` - proxy снизил `getUpdates timeout` до `LOCAL_GETUPDATES_TIMEOUT_SECONDS`.
 - `reason=local-empty-cloud-pending` - local жив, но cloud содержит свежие pending updates.
 - `action=cloud-pending-probe` - proxy проверил cloud backlog через `getWebhookInfo`.
 - `action=virtualized-update-id` - cloud `update_id` поднят выше local offset.
 - `action=ack-dropped` - proxy подтвердил старые local updates, чтобы они не вернулись снова.
 - `action=fallback-blocked` - fallback запрещен политикой, например для `multipart/form-data`.
+- `cause=` - вложенная причина Node `fetch`/socket ошибки, если она есть.
 - `dropped=` - proxy отфильтровал updates ниже OpenClaw offset.
 - `translated=yes` - cloud `update_id` виртуально поднят выше local offset.
 - `activeStreaming*=` - сколько streaming download/upload/passthrough сейчас идет через proxy.
