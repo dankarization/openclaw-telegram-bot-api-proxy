@@ -178,6 +178,14 @@ function isSafeMethodForStatusFallback(method) {
   return safeCloudFallbackMethods.has(method);
 }
 
+// Cloud getUpdates может вернуть file_id, который local Bot API ещё не видел.
+// В этом случае local getFile отвечает 400, но cloud API всё ещё может его разрешить.
+function shouldRetryCloudAfterLocalStatus(method, statusCode) {
+  if (statusCode === 401 || statusCode === 404) return true;
+  if (method === "getFile" && statusCode === 400) return true;
+  return false;
+}
+
 // Ключ кэша размера файла привязан к botId, потому что file_path уникален в рамках бота.
 function fileInfoKey(token, filePath) {
   return `${botIdFromToken(token)}:${filePath}`;
@@ -991,7 +999,7 @@ async function handleBuffered(req, res, method, token, startedAt) {
       log(`method=getUpdates target=local action=dropped-local-update dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"} ackOffset=${localGuard.ackOffset ?? "none"}`);
       await acknowledgeDroppedLocalUpdates(localReq, token, localBody, localGuard.ackOffset);
     }
-    if (cloudFallbackAllowed && (local.statusCode === 401 || local.statusCode === 404) && body.length <= bufferLimitBytes) {
+    if (cloudFallbackAllowed && shouldRetryCloudAfterLocalStatus(method, local.statusCode) && body.length <= bufferLimitBytes) {
       const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
       const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
