@@ -18,6 +18,8 @@ const cloudFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_FALLBACK, fal
 const telegramOffsetDir = process.env.TELEGRAM_OFFSET_DIR || "telegram";
 // Максимальный известный размер файла, который разрешено скачать через cloud fallback.
 const cloudFileFallbackMaxBytes = Number.parseInt(process.env.CLOUD_FILE_FALLBACK_MAX_BYTES || String(20 * 1024 * 1024), 10);
+// TTL связи file_path с upstream, который вернул успешный getFile.
+const fileInfoCacheTtlMs = parsePositiveInteger(process.env.FILE_INFO_CACHE_TTL_MS, 5 * 60 * 1000);
 // Контейнерный префикс absolute file_path, который Docker Bot API возвращает в --local.
 const localFilePathRewriteFrom = trimPathPrefix(process.env.LOCAL_FILE_PATH_REWRITE_FROM || "");
 // Host-префикс того же volume, доступный OpenClaw для прямого чтения файла.
@@ -94,7 +96,7 @@ let lastHealthLogState = "";
 const cloudUpdateStateByBotId = new Map();
 // Перевод local update_id в виртуальную шкалу после cloud getUpdates fallback.
 const localUpdateStateByBotId = new Map();
-// Кэш file_path -> file_size из getFile, чтобы решать, можно ли фолбечить /file.
+// Кэш getFile metadata: размер ограничивает cloud download, source сохраняет upstream affinity.
 const fileInfoByBotIdAndPath = new Map();
 // Кэш pending_update_count из cloud getWebhookInfo по каждому botId.
 const cloudPendingProbeByBotId = new Map();
@@ -192,22 +194,38 @@ function shouldRetryCloudAfterLocalStatus(method, statusCode) {
   return false;
 }
 
-// Ключ кэша размера файла привязан к botId, потому что file_path уникален в рамках бота.
+// Ключ кэша привязан к botId, но не содержит секретную часть token.
 function fileInfoKey(token, filePath) {
   return `${botIdFromToken(token)}:${filePath}`;
 }
 
-function cacheFileInfo(token, filePath, fileSize) {
+function pruneExpiredFileInfo(now = Date.now()) {
+  for (const [key, info] of fileInfoByBotIdAndPath) {
+    if (now - info.cachedAt >= fileInfoCacheTtlMs) fileInfoByBotIdAndPath.delete(key);
+  }
+}
+
+function cacheFileInfo(token, filePath, fileSize, source) {
   const botId = botIdFromToken(token);
-  if (!botId || !filePath) return;
+  if (!botId || !filePath || (source !== "local" && source !== "cloud")) return;
+  const now = Date.now();
+  pruneExpiredFileInfo(now);
   fileInfoByBotIdAndPath.set(fileInfoKey(token, filePath), {
     fileSize: numericOffset(fileSize),
-    cachedAt: Date.now(),
+    source,
+    cachedAt: now,
   });
 }
 
 function cachedFileInfo(token, filePath) {
-  return fileInfoByBotIdAndPath.get(fileInfoKey(token, filePath)) || null;
+  const key = fileInfoKey(token, filePath);
+  const info = fileInfoByBotIdAndPath.get(key);
+  if (!info) return null;
+  if (Date.now() - info.cachedAt >= fileInfoCacheTtlMs) {
+    fileInfoByBotIdAndPath.delete(key);
+    return null;
+  }
+  return info;
 }
 
 function processGetFileResult(method, token, upstream, target) {
@@ -217,9 +235,9 @@ function processGetFileResult(method, token, upstream, target) {
     const filePath = payload?.result?.file_path;
     if (!payload?.ok || typeof filePath !== "string" || !filePath) return upstream;
     const rewrittenFilePath = target === "local" ? rewriteLocalFilePath(filePath) : filePath;
-    cacheFileInfo(token, filePath, payload.result.file_size);
+    cacheFileInfo(token, filePath, payload.result.file_size, target);
     if (rewrittenFilePath !== filePath) {
-      cacheFileInfo(token, rewrittenFilePath, payload.result.file_size);
+      cacheFileInfo(token, rewrittenFilePath, payload.result.file_size, target);
       return {
         ...upstream,
         headers: {
@@ -265,8 +283,10 @@ function cloudFallbackPolicy(method, token, pathname = "", req = null) {
   const filePath = filePathFromPathname(pathname);
   const info = cachedFileInfo(token, filePath);
   if (info?.fileSize == null) return { allowed: false, reason: "file-size-unknown" };
+  if (info.source === "local") return { allowed: false, reason: "file-source-local", source: "local" };
   if (info.fileSize > cloudFileFallbackMaxBytes) return { allowed: false, reason: "file-too-large" };
-  return { allowed: true, reason: "file-size-within-cloud-limit" };
+  if (info.source !== "cloud") return { allowed: false, reason: "file-source-unknown" };
+  return { allowed: true, reason: "file-source-cloud", source: "cloud" };
 }
 
 function canUseCloudFallback(method, token, pathname = "", req = null) {
@@ -1183,16 +1203,21 @@ async function handleBuffered(req, res, method, token, startedAt) {
 
 async function handleStreaming(req, res, method, token, startedAt) {
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
-  const localIsHealthy = await checkLocalHealth(token);
   const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
   const cloudFallbackAllowed = cloudFallback.allowed;
-  const initialRoot = localIsHealthy || !cloudFallbackAllowed ? localRoot : cloudRoot;
-  const initialTarget = localIsHealthy || !cloudFallbackAllowed ? "local" : "cloud";
+  const affinityTarget = method === "file" && cloudFallback.source === "local"
+    ? "local"
+    : method === "file" && cloudFallback.source === "cloud" && cloudFallbackAllowed
+      ? "cloud"
+      : null;
+  const localIsHealthy = affinityTarget ? null : await checkLocalHealth(token);
+  const initialTarget = affinityTarget || (localIsHealthy || !cloudFallbackAllowed ? "local" : "cloud");
+  const initialRoot = initialTarget === "local" ? localRoot : cloudRoot;
   const streamKind = streamingKind(req, method);
   beginStreaming(streamKind);
   try {
     const result = await forwardStreaming(req, res, initialRoot);
-    log(`method=${method} target=${initialTarget} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
+    log(`method=${method} target=${initialTarget}${affinityTarget ? " reason=file-source-affinity" : ""} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
   } catch (error) {
     if (cloudFallbackAllowed && initialTarget === "local" && isClearlyLocalUnavailable(error) && (req.method === "GET" || req.method === "HEAD")) {
       markLocalUnhealthy(errorReason(error));
@@ -1235,7 +1260,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} cloudFileMaxBytes=${cloudFileFallbackMaxBytes}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.
