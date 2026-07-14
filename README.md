@@ -40,8 +40,10 @@ OpenClaw Gateway
   local Bot API, чтобы они не возвращались снова.
 - `getFile` при local `400` повторяется через cloud: это покрывает file_id,
   полученные из cloud fallback, которые локальный Bot API ещё не знает.
-- `/file/...` уходит в cloud только если размер известен из `getFile` и не
-  больше `CLOUD_FILE_FALLBACK_MAX_BYTES`.
+- Успешный `getFile` на время `FILE_INFO_CACHE_TTL_MS` связывает `file_path`
+  с его upstream: local path скачивается через local, cloud path через cloud.
+- Cloud `/file/...` разрешён только если размер известен из `getFile` и не
+  больше `CLOUD_FILE_FALLBACK_MAX_BYTES`; лимит важнее source affinity.
 - Файлы неизвестного размера и тяжёлые файлы остаются только на local API.
 - Отправка файлов через `multipart/form-data`, где в HTTP-запросе идут сами
   байты файла, не fallback-ится в cloud: такой stream нельзя безопасно
@@ -80,6 +82,7 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `ENABLE_CLOUD_FALLBACK` | `false` | Включить cloud fallback. |
 | `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог OpenClaw offset-файлов. |
 | `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
+| `FILE_INFO_CACHE_TTL_MS` | `300000` | TTL bot-scoped связи `file_path` с local/cloud источником `getFile`. |
 | `LOCAL_FILE_PATH_REWRITE_FROM` | пусто | Контейнерный префикс file_path из local Bot API. |
 | `LOCAL_FILE_PATH_REWRITE_TO` | пусто | Host-префикс того же Docker volume для OpenClaw. |
 | `BUFFER_LIMIT_BYTES` | `8388608` | Лимит буферизации API-запроса. |
