@@ -1,6 +1,9 @@
 # OpenClaw Telegram Bot API Proxy
 
 Proxy для OpenClaw: локальный Telegram Bot API в приоритете, cloud Bot API только как аварийный fallback.
+Он защищает pipeline от расхождения local/cloud Bot API `update_id`, чтобы
+fallback не смешивал разные пространства updates и не ломал выбор voice/media
+файлов.
 
 ## Схема
 
@@ -23,12 +26,20 @@ OpenClaw Gateway
   превращает его в short polling.
 - Cloud fallback включается при ошибке local API после retry или когда local
   `getUpdates` пустой, но в cloud есть свежие pending updates.
+- Если local API здоров и просто возвращает пустой `getUpdates`, cloud pending
+  fallback откладывается минимум на `CLOUD_PENDING_FALLBACK_DELAY_MS`: краткий
+  лаг local Bot API не должен сразу переводить pipeline в cloud.
 - `getUpdates` защищён от старых cloud updates:
   - proxy читает локальный OpenClaw offset;
   - ведёт отдельный cloud cursor;
   - при необходимости поднимает cloud `update_id` выше локального offset.
+- После cloud fallback local `update_id` мостится в виртуальную шкалу над
+  OpenClaw offset, если local и cloud id явно разъехались. Это снижает риск
+  смешать local/cloud update spaces и выбрать не тот voice/media file.
 - Старые local updates ниже OpenClaw offset отбрасываются и подтверждаются в
   local Bot API, чтобы они не возвращались снова.
+- `getFile` при local `400` повторяется через cloud: это покрывает file_id,
+  полученные из cloud fallback, которые локальный Bot API ещё не знает.
 - `/file/...` уходит в cloud только если размер известен из `getFile` и не
   больше `CLOUD_FILE_FALLBACK_MAX_BYTES`.
 - Файлы неизвестного размера и тяжёлые файлы остаются только на local API.
@@ -82,7 +93,9 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
 | `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |
+| `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog перед fallback, когда local API здоров и возвращает пустой `getUpdates`. |
 | `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
+| `LOCAL_VIRTUAL_OFFSET_SKEW_MIN` | `1000000` | Минимальный разрыв между OpenClaw offset и local `update_id`, при котором proxy считает id разными пространствами и мостит local updates в виртуальную шкалу. |
 
 ## OpenClaw
 
