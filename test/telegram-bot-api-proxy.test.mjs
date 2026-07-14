@@ -25,6 +25,7 @@ function parseUpstreamRequest(req) {
       token: apiMatch[1],
       method: apiMatch[2],
       fileId: url.searchParams.get("file_id"),
+      offset: url.searchParams.get("offset"),
       pathname: url.pathname,
     };
   }
@@ -161,6 +162,14 @@ function encodeFilePath(filePath) {
 async function downloadFile(proxyRoot, token, filePath) {
   const response = await fetch(`${proxyRoot}/file/bot${token}/${encodeFilePath(filePath)}`);
   return { status: response.status, body: await response.text() };
+}
+
+async function getUpdates(proxyRoot, token, offset) {
+  const response = await fetch(`${proxyRoot}/bot${token}/getUpdates?offset=${offset}`);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.ok, true, JSON.stringify(payload));
+  return payload.result;
 }
 
 function healthyGetMe(request, healthy = true) {
@@ -361,4 +370,24 @@ test("bot-scoped affinity remains isolated under parallel requests without leaki
   assert.equal(harness.output.value.includes(cloudToken), false);
   assert.equal(harness.local.requests.filter((request) => request.kind === "file").length, 6);
   assert.equal(harness.cloud.requests.filter((request) => request.kind === "file").length, 6);
+});
+
+test("bridged local polling does not re-deliver stale updates", async (t) => {
+  const token = "777777:bridge-secret-value-1234567890";
+  const staleUpdate = { update_id: 5, message: { date: Math.floor(Date.now() / 1000), text: "stale" } };
+  const harness = await startHarness(t, {
+    env: { LOCAL_VIRTUAL_OFFSET_SKEW_MIN: "1" },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, { ok: true, result: [staleUpdate] });
+      }
+      return null;
+    },
+    cloud: (request) => healthyGetMe(request),
+  });
+
+  assert.deepEqual(await getUpdates(harness.proxyRoot, token, 1000), []);
+  assert.deepEqual(await getUpdates(harness.proxyRoot, token, 1001), []);
 });

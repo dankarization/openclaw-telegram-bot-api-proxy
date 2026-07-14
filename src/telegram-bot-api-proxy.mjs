@@ -714,6 +714,10 @@ function translateLocalUpdatesWithBridge(token, payload) {
 
   if (nextLocalFloor !== state.localFloor || nextVirtualFloor !== state.virtualFloor) {
     localUpdateStateByBotId.set(botId, { localFloor: nextLocalFloor, virtualFloor: nextVirtualFloor });
+    const cloudState = cloudUpdateStateByBotId.get(botId);
+    if (cloudState?.virtualFloor != null && nextVirtualFloor > cloudState.virtualFloor) {
+      cloudUpdateStateByBotId.set(botId, { ...cloudState, virtualFloor: nextVirtualFloor });
+    }
     log(`method=getUpdates target=local action=virtualized-local-update-id count=${result.length} dropped=${dropped} localFloor=${nextLocalFloor} virtualFloor=${nextVirtualFloor}`);
   }
 
@@ -742,7 +746,9 @@ function guardedLocalGetUpdates(req, method, token, body, upstream) {
     const translated = translateLocalUpdatesWithBridge(token, payload);
     if (translated) {
       return {
-        upstream: translated.translated ? jsonCloudResponse(upstream, { ...payload, result: translated.result }) : upstream,
+        upstream: translated.translated || translated.dropped > 0
+          ? jsonCloudResponse(upstream, { ...payload, result: translated.result })
+          : upstream,
         dropped: translated.dropped,
         floor: translated.floor,
         ackOffset: translated.ackOffset,
