@@ -21,9 +21,10 @@
   retry/cursor policy instead of the streaming fallback path.
 - Allow operator-supplied bot-scoped local bridge anchors to preserve an already
   verified local-to-virtual cursor mapping across a proxy restart.
-- Require newly created/re-anchored local bridge seeds to use the durable global
-  virtual-ID high-water rather than a potentially lagging downstream ACK cursor;
-  otherwise the ingress spool can silently deduplicate new payloads by event ID.
+- Document the operator invariant that newly created/re-anchored local bridge
+  seeds use the bot/account-scoped durable virtual-ID high-water rather than a
+  potentially lagging downstream ACK cursor; otherwise the ingress spool can
+  silently deduplicate new payloads by event ID.
 - Log `pendingAgeMs`, `translatedLocal`, and `bridgedLocal` for fallback and
   update-id translation diagnostics.
 - Reduce the risk of selecting the wrong voice/media file caused by mixing

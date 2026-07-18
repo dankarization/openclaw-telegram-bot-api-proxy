@@ -90,8 +90,8 @@ Server хранит очередь updates в `tqueue.binlog`, а webhook state 
 - `ack-dropped` всегда с `timeout=0`;
 - для cloud fallback нужен отдельный cursor, потому что cloud `update_id` и local `update_id` могут разойтись;
 - виртуализация cloud `update_id` выше local offset остается правильной защитой от оживления старых сессий.
-- новый/re-anchored local bridge должен начинаться от global durable high-water
-  уже выданных virtual IDs, а не от ACK cursor: ACK-aware watermark может
+- новый/re-anchored local bridge должен начинаться от durable high-water уже
+  выданных virtual IDs этого bot/account, а не от ACK cursor: ACK-aware watermark может
   отставать, тогда повторный event ID будет молча дедуплицирован ingress spool;
 - проверенный affine anchor остаётся валиден через local-only restart, пока
   native local IDs монотонны и cloud mapping не изменил virtual scale.

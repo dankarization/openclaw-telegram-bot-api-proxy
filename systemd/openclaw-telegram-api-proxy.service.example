@@ -33,7 +33,7 @@ Environment=CLOUD_PENDING_FALLBACK_DELAY_MS=60000
 Environment=CLOUD_FRESH_UPDATE_MAX_AGE_MS=21600000
 Environment=LOCAL_VIRTUAL_OFFSET_SKEW_MIN=1000000
 # Optional comma-separated botId:localFloor:virtualFloor anchors for restart continuity.
-# For a new/re-anchored pair, virtualFloor must use the durable global high-water,
+# For a new/re-anchored pair, virtualFloor must use this bot/account's durable high-water,
 # not a possibly lagging downstream ACK cursor.
 Environment=LOCAL_UPDATE_STATE_SEED=
 ExecStart=/usr/bin/node %h/.openclaw/bin/telegram-bot-api-proxy.mjs
