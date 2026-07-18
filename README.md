@@ -24,11 +24,17 @@ OpenClaw Gateway
 - Длительность long poll для local `getUpdates` ограничивается
   `LOCAL_GETUPDATES_TIMEOUT_SECONDS`; значение `0` отключает long poll и
   превращает его в short polling.
-- Cloud fallback включается при ошибке local API после retry или когда local
-  `getUpdates` пустой, но в cloud есть свежие pending updates.
-- Если local API здоров и просто возвращает пустой `getUpdates`, cloud pending
-  fallback откладывается минимум на `CLOUD_PENDING_FALLBACK_DELAY_MS`: краткий
-  лаг local Bot API не должен сразу переводить pipeline в cloud.
+- Cloud fallback для `getUpdates` рассматривается только после сетевой ошибки,
+  timeout или HTTP 5xx от local API после retry. Если native cloud cursor ещё
+  неизвестен, proxy возвращает local-ошибку и не трогает cloud queue: высокий
+  virtual offset удалил бы lower-ID backlog, а автоматический `offset=0` не
+  отличает зеркальные local-дубли от ещё не обработанных updates.
+- Успешный пустой local `getUpdates` возвращается как есть и по умолчанию даже
+  не запускает cloud pending probe. Аварийный rescue старого cloud backlog
+  доступен только через явный `ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY=1`.
+- При включённом empty-local rescue cloud pending fallback откладывается минимум
+  на `CLOUD_PENDING_FALLBACK_DELAY_MS`. Этот opt-in также может инициализировать
+  RAM-only cloud cursor; оператор принимает best-effort риск cross-source dedup.
 - `getUpdates` защищён от старых cloud updates:
   - proxy читает локальный OpenClaw offset;
   - ведёт отдельный cloud cursor;
@@ -91,14 +97,16 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `LOCAL_HEALTH_TIMEOUT_MS` | `2000` | Таймаут health-check через `getMe`. |
 | `UPSTREAM_TIMEOUT_MS` | `130000` | Таймаут upstream-запроса. |
 | `ENABLE_CLOUD_GETUPDATES_FALLBACK` | `true` | Разрешить cloud fallback для `getUpdates` после local retry. |
+| `ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY` | `false` | Явно разрешить cloud pending rescue после успешного пустого local `getUpdates`. |
 | `LOCAL_GETUPDATES_TIMEOUT_SECONDS` | `10` | Максимальный `timeout` для local `getUpdates`; `0` отключает long poll. |
 | `LOCAL_GETUPDATES_MAX_ATTEMPTS` | `4` | Количество local-попыток `getUpdates` перед fallback/ошибкой. |
 | `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
 | `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |
-| `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog перед fallback, когда local API здоров и возвращает пустой `getUpdates`. |
+| `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog для явно включённого empty-local rescue. |
 | `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
 | `LOCAL_VIRTUAL_OFFSET_SKEW_MIN` | `1000000` | Минимальный разрыв между OpenClaw offset и local `update_id`, при котором proxy считает id разными пространствами и мостит local updates в виртуальную шкалу. |
+| `LOCAL_UPDATE_STATE_SEED` | пусто | Необязательные `botId:localFloor:virtualFloor` anchors через запятую для продолжения уже известного affine local bridge после restart; значения не содержат token. |
 
 ## OpenClaw
 

@@ -82,7 +82,11 @@ Server хранит очередь updates в `tqueue.binlog`, а webhook state 
 Что наследуем:
 
 - proxy не должен создавать конкурирующий long poll без нужды;
-- cloud `getUpdates` разрешен только после local failure или после `local-empty + cloud-pending`;
+- cloud `getUpdates` разрешен после network/timeout/HTTP 5xx local failure только
+  при известном native cloud cursor; неизвестный cursor закрывается ошибкой без
+  cloud poll;
+- rescue после `local-empty + cloud-pending` требует отдельного явного opt-in и
+  остается best-effort способом инициализировать RAM-only cloud cursor;
 - `ack-dropped` всегда с `timeout=0`;
 - для cloud fallback нужен отдельный cursor, потому что cloud `update_id` и local `update_id` могут разойтись;
 - виртуализация cloud `update_id` выше local offset остается правильной защитой от оживления старых сессий.

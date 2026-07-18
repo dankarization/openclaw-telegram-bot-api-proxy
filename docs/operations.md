@@ -67,11 +67,15 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 - `target=cloud` - запрос ушел в cloud fallback.
 - `action=retry` - local `getUpdates` временно оборвался или вернул 5xx, proxy повторяет запрос перед fallback.
 - `timeoutCapped=` - proxy снизил `getUpdates timeout` до `LOCAL_GETUPDATES_TIMEOUT_SECONDS`.
-- `reason=local-empty-cloud-pending` - local жив, но cloud содержит свежие pending updates.
-- `action=cloud-pending-probe` - proxy проверил cloud backlog через `getWebhookInfo`.
+- `fallbackReason=local-unavailable` - network/timeout fallback; предварительный retry применяется к `getUpdates`.
+- `fallbackReason=local-5xx` - HTTP 5xx fallback; предварительный retry применяется к `getUpdates`.
+- `fallbackReason=cloud-cursor-uninitialized` - local действительно отказал, но proxy не стал делать cloud `getUpdates`: native cloud cursor неизвестен, поэтому любой автоматический bootstrap мог бы удалить backlog или выдать зеркальные дубли.
+- `reason=local-empty-cloud-pending` - явно включённый empty-local rescue нашёл cloud pending updates.
+- `action=cloud-pending-probe` - opt-in rescue проверил cloud backlog через `getWebhookInfo`.
 - `action=virtualized-update-id` - cloud `update_id` поднят выше local offset.
 - `action=ack-dropped` - proxy подтвердил старые local updates, чтобы они не вернулись снова.
 - `action=fallback-blocked` - fallback запрещен политикой, например для `multipart/form-data`.
+- `localUpdateStateSeeds=` - число проверенных local bridge anchors, загруженных при startup; production restart с уже разошедшимися ID-space должен показывать ожидаемое ненулевое значение.
 - `cause=` - вложенная причина Node `fetch`/socket ошибки, если она есть.
 - `dropped=` - proxy отфильтровал updates ниже OpenClaw offset.
 - `translated=yes` - cloud `update_id` виртуально поднят выше local offset.

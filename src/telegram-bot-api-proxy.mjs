@@ -36,6 +36,8 @@ const localHealthTimeoutMs = Number.parseInt(process.env.LOCAL_HEALTH_TIMEOUT_MS
 const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || "130000", 10);
 // Разрешает аварийный cloud fallback именно для getUpdates после local retry.
 const cloudGetUpdatesFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_GETUPDATES_FALLBACK, true);
+// Разрешает rescue cloud backlog после успешного пустого local getUpdates; только явный opt-in.
+const cloudGetUpdatesOnLocalEmptyEnabled = parseBoolean(process.env.ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY, false);
 // Максимальная длительность local getUpdates long poll в секундах; 0 превращает polling в short poll.
 const localGetUpdatesTimeoutSeconds = parseNonNegativeInteger(process.env.LOCAL_GETUPDATES_TIMEOUT_SECONDS, 10);
 // Количество попыток local getUpdates перед тем, как отдать ошибку или уйти в cloud fallback.
@@ -55,6 +57,8 @@ const cloudPendingFallbackDelayMs = Number.parseInt(process.env.CLOUD_PENDING_FA
 const cloudFreshUpdateMaxAgeMs = Number.parseInt(process.env.CLOUD_FRESH_UPDATE_MAX_AGE_MS || String(6 * 60 * 60 * 1000), 10);
 // Минимальная разница между OpenClaw offset и local update_id, при которой считаем, что id из разных пространств.
 const localVirtualOffsetSkewMin = parsePositiveInteger(process.env.LOCAL_VIRTUAL_OFFSET_SKEW_MIN, 1000000);
+// Необязательные botId:localFloor:virtualFloor anchors сохраняют affine bridge через restart.
+const localUpdateStateSeed = process.env.LOCAL_UPDATE_STATE_SEED || "";
 
 // Служебные методы local/cloud Bot API, которые не отправляют пользовательский контент.
 const localAdminMethods = new Set(["getMe", "getUpdates", "getWebhookInfo", "deleteWebhook"]);
@@ -102,6 +106,7 @@ const fileInfoByBotIdAndPath = new Map();
 const cloudPendingProbeByBotId = new Map();
 // Последний ack старых local update_id, чтобы не долбить локальный Bot API одинаковым offset.
 const localDroppedAckByBotId = new Map();
+const seededLocalUpdateStateCount = seedLocalUpdateStates(localUpdateStateSeed);
 
 // Убираем завершающие слэши у root URL, чтобы дальше безопасно склеивать root + req.url.
 function trimRoot(value) {
@@ -137,6 +142,39 @@ function parsePositiveInteger(value, fallback) {
 function parseNonNegativeInteger(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function exactSafeNonNegativeInteger(value) {
+  const raw = String(value ?? "");
+  if (!/^(0|[1-9]\d*)$/u.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function seedLocalUpdateStates(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const parsedEntries = [];
+  const botIds = new Set();
+  for (const [index, entry] of raw.split(",").entries()) {
+    const fields = entry.trim().split(":");
+    if (fields.length !== 3) throw new Error(`invalid LOCAL_UPDATE_STATE_SEED entry ${index + 1}`);
+    const [botIdRaw, localFloorRaw, virtualFloorRaw] = fields;
+    const botIdNumber = exactSafeNonNegativeInteger(botIdRaw);
+    const localFloor = exactSafeNonNegativeInteger(localFloorRaw);
+    const virtualFloor = exactSafeNonNegativeInteger(virtualFloorRaw);
+    if (botIdNumber == null || botIdNumber === 0 || localFloor == null || virtualFloor == null) {
+      throw new Error(`invalid LOCAL_UPDATE_STATE_SEED entry ${index + 1}`);
+    }
+    const botId = String(botIdNumber);
+    if (botIds.has(botId)) throw new Error(`duplicate LOCAL_UPDATE_STATE_SEED botId at entry ${index + 1}`);
+    botIds.add(botId);
+    parsedEntries.push({ botId, localFloor, virtualFloor });
+  }
+  for (const { botId, localFloor, virtualFloor } of parsedEntries) {
+    localUpdateStateByBotId.set(botId, { localFloor, virtualFloor });
+  }
+  return parsedEntries.length;
 }
 
 // Маскируем Telegram bot token в любых лог-строках, включая неожиданные тексты ошибок.
@@ -189,7 +227,7 @@ function isSafeMethodForStatusFallback(method) {
 // Cloud getUpdates может вернуть file_id, который local Bot API ещё не видел.
 // В этом случае local getFile отвечает 400, но cloud API всё ещё может его разрешить.
 function shouldRetryCloudAfterLocalStatus(method, statusCode) {
-  if (statusCode === 401 || statusCode === 404) return true;
+  if ((statusCode === 401 || statusCode === 404) && method !== "getUpdates") return true;
   if (method === "getFile" && statusCode === 400) return true;
   return false;
 }
@@ -306,10 +344,9 @@ function numericOffset(value) {
 function updateDateMs(update) {
   const seconds = numericOffset(
     update?.message?.date
-      ?? update?.edited_message?.date
+      ?? update?.edited_message?.edit_date
       ?? update?.channel_post?.date
-      ?? update?.edited_channel_post?.date
-      ?? update?.callback_query?.message?.date
+      ?? update?.edited_channel_post?.edit_date
       ?? update?.my_chat_member?.date
       ?? update?.chat_member?.date
       ?? update?.chat_join_request?.date
@@ -498,11 +535,18 @@ function applyGetUpdatesTimeoutCap(req, method, body) {
   };
 }
 
-function cloudRequestForGetUpdates(req, method, token, body) {
-  if (method !== "getUpdates") return { reqUrl: req.url, body, translated: false };
+function cloudRequestForGetUpdates(req, method, token, body, options = {}) {
+  if (method !== "getUpdates") return { reqUrl: req.url, body, translated: false, blocked: false };
   const botId = botIdFromToken(token);
   const state = botId ? cloudUpdateStateByBotId.get(botId) : null;
-  if (!state) return { reqUrl: req.url, body, translated: false };
+  const hasUsableCursor = state?.cloudFloor != null && state?.virtualFloor != null;
+  if (options.requireUsableCursor && !hasUsableCursor) {
+    return { reqUrl: req.url, body, translated: false, blocked: true };
+  }
+  if (options.bootstrapNativeOffset && !hasUsableCursor) {
+    return { ...bodyWithOffset(req, body, 0), translated: true, bootstrapped: true, blocked: false };
+  }
+  if (!state) return { reqUrl: req.url, body, translated: false, blocked: false };
 
   const requestedOffset = requestOffsetValue(req, body);
   let cloudOffset = null;
@@ -513,8 +557,8 @@ function cloudRequestForGetUpdates(req, method, token, body) {
       cloudOffset = state.cloudFloor + 1;
     }
   }
-  if (cloudOffset == null) return { reqUrl: req.url, body, translated: false };
-  return { ...bodyWithOffset(req, body, cloudOffset), translated: true };
+  if (cloudOffset == null) return { reqUrl: req.url, body, translated: false, blocked: false };
+  return { ...bodyWithOffset(req, body, cloudOffset), translated: true, blocked: false };
 }
 
 function localRequestForGetUpdates(req, method, token, body) {
@@ -565,7 +609,11 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
     const maxCloudUpdateId = updateIds.length > 0 ? Math.max(...updateIds) : null;
 
     if (!state && payload.result.length === 0 && botId && localFloor != null) {
-      cloudUpdateStateByBotId.set(botId, { cloudFloor: null, virtualFloor: localFloor });
+      cloudUpdateStateByBotId.set(botId, {
+        cloudFloor: null,
+        virtualFloor: localFloor,
+        filterStaleUpdates: Boolean(options.virtualizeLowerIds),
+      });
       return { upstream, dropped: 0, floor: localFloor, translated: false };
     }
 
@@ -575,7 +623,11 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
       const fresh = payload.result.filter(isFreshCloudUpdate);
       const freshUpdateIds = fresh.map((update) => numericOffset(update?.update_id)).filter((id) => id != null);
       if (freshUpdateIds.length === 0) {
-        cloudUpdateStateByBotId.set(botId, { cloudFloor: maxCloudUpdateId, virtualFloor: localFloor });
+        cloudUpdateStateByBotId.set(botId, {
+          cloudFloor: maxCloudUpdateId,
+          virtualFloor: localFloor,
+          filterStaleUpdates: true,
+        });
         log(`method=getUpdates target=cloud action=virtualized-update-id result=0 dropped=${payload.result.length} floor=${localFloor} reason=stale-cloud-updates`);
         return {
           upstream: jsonCloudResponse(upstream, { ...payload, result: [] }),
@@ -587,16 +639,19 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
 
       const cloudBase = Math.min(...freshUpdateIds) - 1;
       const virtualBase = localFloor;
-      let nextCloudFloor = cloudBase;
+      let nextCloudFloor = maxCloudUpdateId;
       let nextVirtualFloor = virtualBase;
       const result = fresh.map((update) => {
         const cloudUpdateId = numericOffset(update?.update_id);
         const virtualUpdateId = virtualBase + (cloudUpdateId - cloudBase);
-        nextCloudFloor = Math.max(nextCloudFloor, cloudUpdateId);
         nextVirtualFloor = Math.max(nextVirtualFloor, virtualUpdateId);
         return { ...update, update_id: virtualUpdateId };
       });
-      cloudUpdateStateByBotId.set(botId, { cloudFloor: nextCloudFloor, virtualFloor: nextVirtualFloor });
+      cloudUpdateStateByBotId.set(botId, {
+        cloudFloor: nextCloudFloor,
+        virtualFloor: nextVirtualFloor,
+        filterStaleUpdates: true,
+      });
       log(`method=getUpdates target=cloud action=virtualized-update-id count=${result.length} dropped=${payload.result.length - result.length} cloudFloor=${nextCloudFloor} virtualFloor=${nextVirtualFloor}`);
       return {
         upstream: jsonCloudResponse(upstream, { ...payload, result }),
@@ -633,18 +688,25 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
     const result = [];
     let nextCloudFloor = state.cloudFloor ?? cloudBase;
     let nextVirtualFloor = state.virtualFloor ?? virtualBase;
+    const filterStaleUpdates = Boolean(options.virtualizeLowerIds || state.filterStaleUpdates);
 
     for (const update of payload.result) {
       const cloudUpdateId = numericOffset(update?.update_id);
       if (cloudUpdateId == null || cloudUpdateId <= cloudBase) continue;
+      nextCloudFloor = Math.max(nextCloudFloor, cloudUpdateId);
+      if (filterStaleUpdates && !isFreshCloudUpdate(update)) continue;
       const virtualUpdateId = virtualBase + (cloudUpdateId - cloudBase);
       result.push({ ...update, update_id: virtualUpdateId });
-      nextCloudFloor = Math.max(nextCloudFloor, cloudUpdateId);
       nextVirtualFloor = Math.max(nextVirtualFloor, virtualUpdateId);
     }
 
-    if (botId && nextCloudFloor !== state.cloudFloor) {
-      cloudUpdateStateByBotId.set(botId, { cloudFloor: nextCloudFloor, virtualFloor: nextVirtualFloor });
+    if (botId && (nextCloudFloor !== state.cloudFloor || filterStaleUpdates !== Boolean(state.filterStaleUpdates))) {
+      cloudUpdateStateByBotId.set(botId, {
+        ...state,
+        cloudFloor: nextCloudFloor,
+        virtualFloor: nextVirtualFloor,
+        filterStaleUpdates,
+      });
       log(`method=getUpdates target=cloud action=virtualized-update-id count=${result.length} dropped=${payload.result.length - result.length} cloudFloor=${nextCloudFloor} virtualFloor=${nextVirtualFloor}`);
     }
 
@@ -1148,16 +1210,27 @@ async function handleBuffered(req, res, method, token, startedAt) {
       return;
     }
     if (cloudFallbackAllowed && local.statusCode >= 500 && isSafeMethodForStatusFallback(method)) {
-      const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
+      const cloudRequest = cloudRequestForGetUpdates(
+        localReq,
+        method,
+        token,
+        localBody,
+        { requireUsableCursor: method === "getUpdates" },
+      );
+      if (cloudRequest.blocked) {
+        writeBufferedResponse(res, local);
+        log(`method=getUpdates target=local action=fallback-blocked fallbackReason=cloud-cursor-uninitialized reason=local-${local.statusCode} localAttempts=${localAttempt.attempts} status=${local.statusCode} ms=${Date.now() - startedAt}`);
+        return;
+      }
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
       const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
       const cloudResult = guardedCloudGetUpdates(localReq, method, token, localBody, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
-      log(`method=${method} target=cloud reason=local-${local.statusCode} localAttempts=${localAttempt.attempts} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
+      log(`method=${method} target=cloud fallbackReason=local-5xx reason=local-${local.statusCode} localAttempts=${localAttempt.attempts} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
-    if (cloudFallbackAllowed && cloudGetUpdatesFallbackEnabled && localGuard.dropped === 0 && emptySuccessfulGetUpdates(method, local)) {
+    if (cloudGetUpdatesOnLocalEmptyEnabled && cloudFallbackAllowed && cloudGetUpdatesFallbackEnabled && localGuard.dropped === 0 && emptySuccessfulGetUpdates(method, local)) {
       let pendingProbe = null;
       try {
         pendingProbe = await probeCloudPendingUpdates(token);
@@ -1174,13 +1247,19 @@ async function handleBuffered(req, res, method, token, startedAt) {
           log(`method=${method} target=local status=${local.statusCode}${localAttempt.attempts > 1 ? ` attempts=${localAttempt.attempts}` : ""}${localAttempt.timeoutCapped ? ` timeoutCapped=${localAttempt.timeout}` : ""} cloudProbe=deferred ms=${Date.now() - startedAt}`);
           return;
         }
-        const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
+        const cloudRequest = cloudRequestForGetUpdates(
+          localReq,
+          method,
+          token,
+          localBody,
+          { bootstrapNativeOffset: true },
+        );
         const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
         const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
         const cloudResult = guardedCloudGetUpdates(localReq, method, token, localBody, cloudProcessed, { virtualizeLowerIds: true });
         const cloud = cloudResult.upstream;
         writeBufferedResponse(res, cloud);
-        log(`method=${method} target=cloud reason=local-empty-cloud-pending pending=${pendingProbe.pending} cached=${pendingProbe.cached ? "yes" : "no"} pendingAgeMs=${pendingProbe.pendingAgeMs} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
+        log(`method=${method} target=cloud fallbackReason=local-empty-pending-rescue reason=local-empty-cloud-pending pending=${pendingProbe.pending} cached=${pendingProbe.cached ? "yes" : "no"} pendingAgeMs=${pendingProbe.pendingAgeMs} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
         return;
       }
     }
@@ -1190,13 +1269,23 @@ async function handleBuffered(req, res, method, token, startedAt) {
     if (cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
       markLocalUnhealthy(errorReason(error));
       const fallbackRequest = applyGetUpdatesTimeoutCap(req, method, body);
-      const cloudRequest = cloudRequestForGetUpdates(fallbackRequest.req, method, token, fallbackRequest.body);
+      const cloudRequest = cloudRequestForGetUpdates(
+        fallbackRequest.req,
+        method,
+        token,
+        fallbackRequest.body,
+        { requireUsableCursor: method === "getUpdates" },
+      );
+      if (cloudRequest.blocked) {
+        log(`method=getUpdates target=local action=fallback-blocked fallbackReason=cloud-cursor-uninitialized ${errorLogFields(error)} ms=${Date.now() - startedAt}`);
+        throw error;
+      }
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl);
       const cloudProcessed = processGetFileResult(method, token, cloudRaw, "cloud");
       const cloudResult = guardedCloudGetUpdates(fallbackRequest.req, method, token, fallbackRequest.body, cloudProcessed);
       const cloud = cloudResult.upstream;
       writeBufferedResponse(res, cloud);
-      log(`method=${method} target=cloud ${errorLogFields(error)} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
+      log(`method=${method} target=cloud fallbackReason=local-unavailable ${errorLogFields(error)} status=${cloud.statusCode} dropped=${cloudResult.dropped} floor=${cloudResult.floor ?? "none"} translated=${cloudRequest.translated || cloudResult.translated ? "yes" : "no"} ms=${Date.now() - startedAt}`);
       return;
     }
     if (!cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
@@ -1248,7 +1337,7 @@ const server = http.createServer(async (req, res) => {
   const method = methodFromPath(pathname);
   const token = tokenFromPath(pathname);
   try {
-    if (canBufferRequest(req)) {
+    if (method === "getUpdates" || canBufferRequest(req)) {
       await handleBuffered(req, res, method, token, startedAt);
     } else {
       await handleStreaming(req, res, method, token, startedAt);
@@ -1266,7 +1355,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.
