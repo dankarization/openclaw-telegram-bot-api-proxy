@@ -106,7 +106,7 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog для явно включённого empty-local rescue. |
 | `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
 | `LOCAL_VIRTUAL_OFFSET_SKEW_MIN` | `1000000` | Минимальный разрыв между OpenClaw offset и local `update_id`, при котором proxy считает id разными пространствами и мостит local updates в виртуальную шкалу. |
-| `LOCAL_UPDATE_STATE_SEED` | пусто | Необязательные `botId:localFloor:virtualFloor` anchors через запятую для продолжения уже известного affine local bridge после restart; для нового anchor нужен durable high-water этого bot/account, а не отстающий ACK cursor. Значения не содержат token. |
+| `LOCAL_UPDATE_STATE_SEED` | пусто | Необязательные `botId:localFloor:virtualFloor` anchors через запятую для продолжения уже известного affine local bridge после restart; для нового anchor нужен durable Telegram event-ID high-water этого bot/account, а не отстающий ACK cursor. Значения не содержат token. |
 
 ## OpenClaw
 
@@ -127,7 +127,7 @@ telegram/update-offset-syncopia-guest-bot.json
 
 Текущие версии могут хранить ACK cursor в SQLite namespace
 `telegram.update-offsets`, а уже принятые event IDs — в durable ingress spool.
-ACK cursor может отставать от максимального когда-либо выданного virtual ID,
+ACK cursor может отставать от максимального когда-либо использованного event ID,
 например после handler timeout.
 
 При создании или перепривязке `LOCAL_UPDATE_STATE_SEED` берите одну парную
@@ -135,8 +135,9 @@ ACK cursor может отставать от максимального ког�
 
 - `localFloor` — максимальный native local update ID, уже подтверждённый этим
   bridge upstream; pending/unconsumed update сюда включать нельзя;
-- `virtualFloor` — high-water уже выданных/записанных virtual IDs именно этого
-  bot/account, включая durable ingress spool, даже если persisted ACK cursor ниже.
+- `virtualFloor` — high-water всех event IDs именно этого bot/account, уже
+  записанных в durable ingress spool или ранее выданных bridge, независимо от
+  того, были они native или virtual, даже если persisted ACK cursor ниже.
 
 Если взять `virtualFloor` из отстающего ACK cursor или только из RAM proxy,
 новые updates могут получить уже существующие event IDs и будут дедуплицированы

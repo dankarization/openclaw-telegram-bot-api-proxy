@@ -62,12 +62,13 @@ sed -n '1,120p' telegram/update-offset-default.json
 1. `localFloor` должен быть максимальным native local update ID, уже
    подтверждённым этим bridge upstream. Pending/unconsumed update сюда включать
    нельзя: такой anchor пропустит его.
-2. `virtualFloor` должен быть не ниже максимального virtual ID этого
-   bot/account, когда-либо записанного в durable ingress spool.
+2. `virtualFloor` должен быть не ниже максимального Telegram event ID этого
+   bot/account, когда-либо записанного в durable ingress spool или ранее
+   выданного bridge. Spool conflict key не различает native и virtual ID.
 3. Нельзя использовать только persisted `lastUpdateId`: ACK-aware watermark
    может отставать после handler timeout.
 4. Убедитесь, что следующий native update получит virtual ID строго выше
-   bot/account-scoped durable high-water.
+   bot/account-scoped durable event-ID high-water.
 
 Нарушение этого инварианта не обязательно даёт ошибку: durable spool может
 выполнить `ON CONFLICT DO NOTHING` по старому event ID и молча отбросить новый
@@ -94,7 +95,7 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 - `action=virtualized-update-id` - cloud `update_id` поднят выше local offset.
 - `action=ack-dropped` - proxy подтвердил старые local updates, чтобы они не вернулись снова.
 - `action=fallback-blocked` - fallback запрещен политикой, например для `multipart/form-data`.
-- `localUpdateStateSeeds=` - число синтаксически проверенных local bridge anchors, загруженных при startup; это не доказывает, что anchor согласован с bot/account-scoped durable high-water.
+- `localUpdateStateSeeds=` - число синтаксически проверенных local bridge anchors, загруженных при startup; это не доказывает, что anchor согласован с bot/account-scoped durable event-ID high-water.
 - `cause=` - вложенная причина Node `fetch`/socket ошибки, если она есть.
 - `dropped=` - proxy отфильтровал updates ниже OpenClaw offset.
 - `translated=yes` - cloud `update_id` виртуально поднят выше local offset.
