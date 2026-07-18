@@ -7,14 +7,45 @@ fallback не смешивал разные пространства updates и 
 
 ## Схема
 
-```text
-OpenClaw Gateway
-  -> http://127.0.0.1:8082
-  -> openclaw-telegram-bot-api-proxy
-      primary  -> http://127.0.0.1:8081
-                  Docker aiogram/telegram-bot-api:latest --local
-      fallback -> https://api.telegram.org
+```mermaid
+flowchart LR
+    OpenClaw[OpenClaw Gateway] -->|Bot API requests| Proxy[Telegram Bot API Proxy<br/>127.0.0.1:8082]
+    Proxy -->|primary| Local[Local Bot API<br/>127.0.0.1:8081]
+    Proxy -.->|guarded emergency fallback| Cloud[Cloud Bot API]
+    Local --> Telegram[Telegram]
+    Cloud --> Telegram
 ```
+
+Решение для `getUpdates` принимается отдельно от fallback остальных методов:
+
+```mermaid
+sequenceDiagram
+    participant O as OpenClaw
+    participant P as Proxy
+    participant L as Local Bot API
+    participant C as Cloud Bot API
+
+    O->>P: getUpdates(virtual offset)
+    P->>L: getUpdates(local offset, transient retry)
+    alt Local вернул HTTP 200, включая пустой result
+        L-->>P: local result
+        P-->>O: guarded local result
+    else Network, timeout или HTTP 5xx после retry
+        alt Native cloud cursor известен
+            P->>C: getUpdates(native cloud offset)
+            C-->>P: cloud updates
+            P-->>O: updates с защищёнными virtual IDs
+        else Native cloud cursor неизвестен
+            P-->>O: local error, fail closed
+        end
+    else Local вернул другой HTTP non-5xx
+        P-->>O: local response без cloud fallback
+    end
+```
+
+Это default-путь. Явный empty-local rescue на схеме не показан: он выключен по
+умолчанию, ждёт `CLOUD_PENDING_FALLBACK_DELAY_MS` и остаётся best-effort
+режимом с риском cross-source дублей.
 
 ## Поведение
 
@@ -36,7 +67,8 @@ OpenClaw Gateway
   на `CLOUD_PENDING_FALLBACK_DELAY_MS`. Этот opt-in также может инициализировать
   RAM-only cloud cursor; оператор принимает best-effort риск cross-source dedup.
 - `getUpdates` защищён от старых cloud updates:
-  - proxy читает локальный OpenClaw offset;
+  - proxy читает client offset текущего `getUpdates` и при наличии legacy
+    offset-файл OpenClaw;
   - ведёт отдельный cloud cursor;
   - при необходимости поднимает cloud `update_id` выше локального offset.
 - После cloud fallback local `update_id` мостится в виртуальную шкалу над
@@ -54,6 +86,26 @@ OpenClaw Gateway
 - Отправка файлов через `multipart/form-data`, где в HTTP-запросе идут сами
   байты файла, не fallback-ится в cloud: такой stream нельзя безопасно
   повторить, а cloud Bot API не рассчитан на наши большие local-файлы.
+
+### Маршрутизация файлов
+
+```mermaid
+flowchart TD
+    Request[getFile] --> Health{Local health state}
+    Health -->|healthy| Local[Запрос в local Bot API]
+    Health -->|cached unhealthy и fallback разрешён| Cloud[Запрос getFile через cloud]
+    Local -->|успех| LocalCache[Запомнить local source affinity]
+    Local -->|разрешённая политикой ошибка| Cloud
+    LocalCache --> LocalDownload[Скачать через local<br/>включая файлы больше 20 MiB]
+    Cloud -->|успех| CloudCache[Запомнить cloud source affinity]
+    CloudCache --> Size{Размер известен и<br/>не больше cloud-лимита?}
+    Size -->|да| CloudDownload[Скачать через cloud]
+    Size -->|нет| Block[Не выполнять cloud download]
+```
+
+Типичный разрешённый переход для `getFile` — local HTTP 400 для `file_id` из
+cloud update. Также действуют общие policy-approved network/5xx fallback.
+Multipart upload через cloud никогда автоматически не повторяется.
 
 ## Требования
 
@@ -144,6 +196,21 @@ ACK cursor может отставать от максимального ког�
 до маршрутизации. Проверенный старый anchor остаётся валиден между restart при
 монотонных local IDs и неизменном affine mapping; после cloud mapping или reset
 native ID anchor нужно проверить заново.
+
+Proxy не читает SQLite и durable ingress spool автоматически: их high-water —
+operator input при проверке или создании seed. Seed восстанавливает только
+проверенный local affine bridge; cloud cursor и выданные batch остаются в RAM.
+
+## Границы текущей версии
+
+- Native↔virtual mapping и cloud cursor не являются durable ACK-aware state.
+- Повтор после потерянного HTTP-ответа не гарантирует тот же batch с теми же
+  virtual IDs, а partial ACK не хранится как отдельное pending-состояние.
+- Нет persistent fingerprint ledger для семантической дедупликации зеркальных
+  local/cloud updates.
+- Параллельные `getUpdates` одного bot пока не сериализуются внутри proxy.
+- Поэтому абсолютный exactly-once не заявляется; неизвестный cloud cursor по
+  умолчанию приводит к fail-closed ошибке, сохраняя cloud backlog нетронутым.
 
 ## Документация
 

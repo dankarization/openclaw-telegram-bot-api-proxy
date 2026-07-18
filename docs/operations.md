@@ -56,6 +56,8 @@ sed -n '1,120p' telegram/update-offset-default.json
 `telegram.update-offsets`, а принятые event IDs — в durable ingress spool.
 Проверяйте оба источника перед созданием или перепривязкой
 `LOCAL_UPDATE_STATE_SEED`.
+Proxy не запрашивает SQLite или spool автоматически: найденные там значения
+являются operator input для проверки seed, а не runtime-state proxy.
 
 Для нового anchor `botId:localFloor:virtualFloor`:
 
