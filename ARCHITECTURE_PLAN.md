@@ -9,16 +9,16 @@
 
 ## Целевая схема
 
-```text
-OpenClaw Gateway
-  -> http://127.0.0.1:8082
-  -> openclaw-telegram-bot-api-proxy
-      primary  -> http://127.0.0.1:8081
-                  Docker aiogram/telegram-bot-api:latest --local
-      fallback -> https://api.telegram.org
+```mermaid
+flowchart LR
+    OpenClaw[OpenClaw Gateway] -->|Bot API requests| Proxy[Telegram Bot API Proxy<br/>127.0.0.1:8082]
+    Proxy -->|primary| Local[Local Bot API<br/>Docker, local mode]
+    Proxy -.->|guarded emergency fallback| Cloud[Cloud Bot API]
+    Local --> Telegram[Telegram]
+    Cloud --> Telegram
 ```
 
-Основное правило: локальный Bot API всегда первичен. Cloud используется только как аварийный канал для безопасных запросов и не должен молча откатывать OpenClaw на старые `update_id`.
+Основное правило: локальный Bot API всегда первичен. Cloud используется только как аварийный канал для разрешённых политикой запросов и не должен молча откатывать OpenClaw на старые `update_id`.
 
 ## Что берем из tdlib/telegram-bot-api
 
@@ -82,10 +82,49 @@ Server хранит очередь updates в `tqueue.binlog`, а webhook state 
 Что наследуем:
 
 - proxy не должен создавать конкурирующий long poll без нужды;
-- cloud `getUpdates` разрешен только после local failure или после `local-empty + cloud-pending`;
+- cloud `getUpdates` разрешен после network/timeout/HTTP 5xx local failure только
+  при известном native cloud cursor; неизвестный cursor закрывается ошибкой без
+  cloud poll;
+- rescue после `local-empty + cloud-pending` требует отдельного явного opt-in и
+  остается best-effort способом инициализировать RAM-only cloud cursor;
 - `ack-dropped` всегда с `timeout=0`;
 - для cloud fallback нужен отдельный cursor, потому что cloud `update_id` и local `update_id` могут разойтись;
 - виртуализация cloud `update_id` выше local offset остается правильной защитой от оживления старых сессий.
+- новый/re-anchored local bridge должен начинаться от durable event-ID high-water
+  этого bot/account (native или virtual), а не от ACK cursor: ACK-aware watermark может
+  отставать, тогда повторный event ID будет молча дедуплицирован ingress spool;
+- проверенный affine anchor остаётся валиден через local-only restart, пока
+  native local IDs монотонны и cloud mapping не изменил virtual scale.
+
+Local и cloud используют независимые native ID. Proxy сводит их в одну
+монотонную шкалу, которую видит durable ingress OpenClaw:
+
+```mermaid
+flowchart LR
+    subgraph Upstream[Независимые upstream ID spaces]
+        LocalId[Local native update_id]
+        CloudId[Cloud native update_id]
+    end
+
+    Anchor[Проверенный restart anchor<br/>localFloor ↔ virtualFloor] --> Bridge[Bot-scoped ID bridge]
+    LocalId --> Bridge
+    CloudId --> Bridge
+    Bridge --> Virtual[Монотонный virtual event ID]
+    Virtual --> Ingress[OpenClaw durable ingress]
+    Ingress --> HighWater[Durable event-ID high-water]
+    Ingress --> Ack[ACK cursor]
+    Ack -.->|может отставать от| HighWater
+    HighWater -->|operator задаёт новый virtualFloor| Anchor
+```
+
+`ACK cursor` показывает подтверждённое потребителем продвижение и может
+отставать после timeout. `Durable event-ID high-water` защищает уникальность
+новых event IDs. Поэтому новый или перепривязанный anchor обязан учитывать
+high-water конкретного bot/account, даже если ACK cursor ниже.
+Proxy сам не читает SQLite или durable ingress spool: оператор проверяет их и
+передаёт валидированный anchor через `LOCAL_UPDATE_STATE_SEED`. Этот seed
+восстанавливает local affine mapping; cloud cursor и выданные batch пока
+остаются RAM-only.
 
 ### Файлы и пути
 
@@ -188,7 +227,7 @@ Nginx пример дает несколько полезных настроек
 - ~~Добавить `docs/operations.md` с командами проверки local/cloud ownership, очереди и логов.~~
 - ~~Обновить README короткой схемой: OpenClaw -> proxy -> local Bot API -> cloud fallback.~~
 
-### Этап 2. Укрепление proxy
+### ~~Этап 2. Укрепление proxy~~
 
 - ~~Маскировать bot token в логах.~~
 - ~~Добавить счетчики active streaming requests.~~
@@ -215,7 +254,8 @@ Nginx пример дает несколько полезных настроек
   - `getUpdates` при пустой local очереди;
   - маленькое фото через `getFile` и `/file`;
   - файл больше cloud лимита через local only;
-  - local down -> cloud text command fallback.
+  - local down -> cloud text command fallback при известном native cloud
+    cursor; неизвестный cursor должен дать fail-closed ошибку.
 - Stale update test:
   - искусственно подать local update ниже OpenClaw offset;
   - убедиться, что proxy его отбрасывает и делает `ack-dropped`;
@@ -223,7 +263,22 @@ Nginx пример дает несколько полезных настроек
 - Migration test:
   - старый local server закрыт;
   - новый server использует корректный volume;
-  - cloud fallback не начинает читать старую cloud очередь без virtual offset.
+  - cloud fallback не начинает читать старую cloud очередь без известного
+    native cloud cursor.
+
+### Этап 5. Durable reconciliation
+
+- Хранить bot-scoped native↔virtual mapping и состояние выданных batch в
+  транзакционном persistent store.
+- Повторять тот же batch с теми же virtual IDs после потерянного HTTP-ответа.
+- Продвигать upstream native cursor только после следующего downstream ACK.
+- Сериализовать `getUpdates` отдельно для каждого bot, чтобы параллельные polls
+  не конфликтовали и не опережали ACK.
+- Дедуплицировать зеркальные local/cloud updates по стабильному fingerprint без
+  `update_id`, сохраняя committed ledger дольше максимального cloud backlog.
+- Инициализировать неизвестный cloud cursor через неразрушающий `offset=0`
+  только после появления durable ledger, способного отделить дубли от новых
+  событий.
 
 ## Риски
 
@@ -231,6 +286,13 @@ Nginx пример дает несколько полезных настроек
 - Если удалить Docker volume, local server может потерять контекст и снова принести старые/разъехавшиеся updates.
 - Если OpenClaw получает absolute `file_path` из контейнера без rewrite, медиа может ломаться даже при здоровом local Bot API.
 - Если proxy начнет fallback-ить multipart/upload в cloud, большие файлы будут ломаться и могут создавать дубли side effects.
+- Текущий native↔virtual bridge хранит runtime-state в RAM и восстанавливается
+  operator-provided anchor. До реализации durable ACK-aware state потерянный
+  ответ, partial ACK, restart или параллельные polls могут привести к дублю,
+  пропуску или `409`.
+- Без стабильного cross-source fingerprint нельзя надёжно отличить свежую
+  cloud-копию уже обработанного local update от нового события. Поэтому
+  неизвестный cloud cursor по умолчанию закрывается ошибкой.
 
 ## Решение по умолчанию
 

@@ -7,14 +7,45 @@ fallback не смешивал разные пространства updates и 
 
 ## Схема
 
-```text
-OpenClaw Gateway
-  -> http://127.0.0.1:8082
-  -> openclaw-telegram-bot-api-proxy
-      primary  -> http://127.0.0.1:8081
-                  Docker aiogram/telegram-bot-api:latest --local
-      fallback -> https://api.telegram.org
+```mermaid
+flowchart LR
+    OpenClaw[OpenClaw Gateway] -->|Bot API requests| Proxy[Telegram Bot API Proxy<br/>127.0.0.1:8082]
+    Proxy -->|primary| Local[Local Bot API<br/>127.0.0.1:8081]
+    Proxy -.->|guarded emergency fallback| Cloud[Cloud Bot API]
+    Local --> Telegram[Telegram]
+    Cloud --> Telegram
 ```
+
+Решение для `getUpdates` принимается отдельно от fallback остальных методов:
+
+```mermaid
+sequenceDiagram
+    participant O as OpenClaw
+    participant P as Proxy
+    participant L as Local Bot API
+    participant C as Cloud Bot API
+
+    O->>P: getUpdates(virtual offset)
+    P->>L: getUpdates(local offset, transient retry)
+    alt Local вернул HTTP 200, включая пустой result
+        L-->>P: local result
+        P-->>O: guarded local result
+    else Network, timeout или HTTP 5xx после retry
+        alt Native cloud cursor известен
+            P->>C: getUpdates(native cloud offset)
+            C-->>P: cloud updates
+            P-->>O: updates с защищёнными virtual IDs
+        else Native cloud cursor неизвестен
+            P-->>O: local error, fail closed
+        end
+    else Local вернул другой HTTP non-5xx
+        P-->>O: local response без cloud fallback
+    end
+```
+
+Это default-путь. Явный empty-local rescue на схеме не показан: он выключен по
+умолчанию, ждёт `CLOUD_PENDING_FALLBACK_DELAY_MS` и остаётся best-effort
+режимом с риском cross-source дублей.
 
 ## Поведение
 
@@ -24,13 +55,20 @@ OpenClaw Gateway
 - Длительность long poll для local `getUpdates` ограничивается
   `LOCAL_GETUPDATES_TIMEOUT_SECONDS`; значение `0` отключает long poll и
   превращает его в short polling.
-- Cloud fallback включается при ошибке local API после retry или когда local
-  `getUpdates` пустой, но в cloud есть свежие pending updates.
-- Если local API здоров и просто возвращает пустой `getUpdates`, cloud pending
-  fallback откладывается минимум на `CLOUD_PENDING_FALLBACK_DELAY_MS`: краткий
-  лаг local Bot API не должен сразу переводить pipeline в cloud.
+- Cloud fallback для `getUpdates` рассматривается только после сетевой ошибки,
+  timeout или HTTP 5xx от local API после retry. Если native cloud cursor ещё
+  неизвестен, proxy возвращает local-ошибку и не трогает cloud queue: высокий
+  virtual offset удалил бы lower-ID backlog, а автоматический `offset=0` не
+  отличает зеркальные local-дубли от ещё не обработанных updates.
+- Успешный пустой local `getUpdates` возвращается как есть и по умолчанию даже
+  не запускает cloud pending probe. Аварийный rescue старого cloud backlog
+  доступен только через явный `ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY=1`.
+- При включённом empty-local rescue cloud pending fallback откладывается минимум
+  на `CLOUD_PENDING_FALLBACK_DELAY_MS`. Этот opt-in также может инициализировать
+  RAM-only cloud cursor; оператор принимает best-effort риск cross-source dedup.
 - `getUpdates` защищён от старых cloud updates:
-  - proxy читает локальный OpenClaw offset;
+  - proxy читает client offset текущего `getUpdates` и при наличии legacy
+    offset-файл OpenClaw;
   - ведёт отдельный cloud cursor;
   - при необходимости поднимает cloud `update_id` выше локального offset.
 - После cloud fallback local `update_id` мостится в виртуальную шкалу над
@@ -48,6 +86,26 @@ OpenClaw Gateway
 - Отправка файлов через `multipart/form-data`, где в HTTP-запросе идут сами
   байты файла, не fallback-ится в cloud: такой stream нельзя безопасно
   повторить, а cloud Bot API не рассчитан на наши большие local-файлы.
+
+### Маршрутизация файлов
+
+```mermaid
+flowchart TD
+    Request[getFile] --> Health{Local health state}
+    Health -->|healthy| Local[Запрос в local Bot API]
+    Health -->|cached unhealthy и fallback разрешён| Cloud[Запрос getFile через cloud]
+    Local -->|успех| LocalCache[Запомнить local source affinity]
+    Local -->|разрешённая политикой ошибка| Cloud
+    LocalCache --> LocalDownload[Скачать через local<br/>включая файлы больше 20 MiB]
+    Cloud -->|успех| CloudCache[Запомнить cloud source affinity]
+    CloudCache --> Size{Размер известен и<br/>не больше cloud-лимита?}
+    Size -->|да| CloudDownload[Скачать через cloud]
+    Size -->|нет| Block[Не выполнять cloud download]
+```
+
+Типичный разрешённый переход для `getFile` — local HTTP 400 для `file_id` из
+cloud update. Также действуют общие policy-approved network/5xx fallback.
+Multipart upload через cloud никогда автоматически не повторяется.
 
 ## Требования
 
@@ -80,7 +138,7 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `LOCAL_API_ROOT` | `http://127.0.0.1:8081` | Локальный Docker Bot API. |
 | `CLOUD_API_ROOT` | `https://api.telegram.org` | Cloud Bot API. |
 | `ENABLE_CLOUD_FALLBACK` | `false` | Включить cloud fallback. |
-| `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог OpenClaw offset-файлов. |
+| `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог legacy OpenClaw offset-файлов; новые OpenClaw могут хранить offset в SQLite. |
 | `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
 | `FILE_INFO_CACHE_TTL_MS` | `300000` | TTL bot-scoped связи `file_path` с local/cloud источником `getFile`. |
 | `LOCAL_FILE_PATH_REWRITE_FROM` | пусто | Контейнерный префикс file_path из local Bot API. |
@@ -91,14 +149,16 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `LOCAL_HEALTH_TIMEOUT_MS` | `2000` | Таймаут health-check через `getMe`. |
 | `UPSTREAM_TIMEOUT_MS` | `130000` | Таймаут upstream-запроса. |
 | `ENABLE_CLOUD_GETUPDATES_FALLBACK` | `true` | Разрешить cloud fallback для `getUpdates` после local retry. |
+| `ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY` | `false` | Явно разрешить cloud pending rescue после успешного пустого local `getUpdates`. |
 | `LOCAL_GETUPDATES_TIMEOUT_SECONDS` | `10` | Максимальный `timeout` для local `getUpdates`; `0` отключает long poll. |
 | `LOCAL_GETUPDATES_MAX_ATTEMPTS` | `4` | Количество local-попыток `getUpdates` перед fallback/ошибкой. |
 | `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
 | `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |
-| `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog перед fallback, когда local API здоров и возвращает пустой `getUpdates`. |
+| `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog для явно включённого empty-local rescue. |
 | `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
 | `LOCAL_VIRTUAL_OFFSET_SKEW_MIN` | `1000000` | Минимальный разрыв между OpenClaw offset и local `update_id`, при котором proxy считает id разными пространствами и мостит local updates в виртуальную шкалу. |
+| `LOCAL_UPDATE_STATE_SEED` | пусто | Необязательные `botId:localFloor:virtualFloor` anchors через запятую для продолжения уже известного affine local bridge после restart; для нового anchor нужен durable Telegram event-ID high-water этого bot/account, а не отстающий ACK cursor. Значения не содержат token. |
 
 ## OpenClaw
 
@@ -110,17 +170,50 @@ systemd/openclaw-telegram-api-proxy.service.example
 }
 ```
 
-Proxy использует offset-файлы OpenClaw:
+Старые версии OpenClaw использовали offset-файлы:
 
 ```text
 telegram/update-offset-default.json
 telegram/update-offset-syncopia-guest-bot.json
 ```
 
-В файлах нужны `botId` и `lastUpdateId`.
+Текущие версии могут хранить ACK cursor в SQLite namespace
+`telegram.update-offsets`, а уже принятые event IDs — в durable ingress spool.
+ACK cursor может отставать от максимального когда-либо использованного event ID,
+например после handler timeout.
+
+При создании или перепривязке `LOCAL_UPDATE_STATE_SEED` берите одну парную
+точку affine mapping:
+
+- `localFloor` — максимальный native local update ID, уже подтверждённый этим
+  bridge upstream; pending/unconsumed update сюда включать нельзя;
+- `virtualFloor` — high-water всех event IDs именно этого bot/account, уже
+  записанных в durable ingress spool или ранее выданных bridge, независимо от
+  того, были они native или virtual, даже если persisted ACK cursor ниже.
+
+Если взять `virtualFloor` из отстающего ACK cursor или только из RAM proxy,
+новые updates могут получить уже существующие event IDs и будут дедуплицированы
+до маршрутизации. Проверенный старый anchor остаётся валиден между restart при
+монотонных local IDs и неизменном affine mapping; после cloud mapping или reset
+native ID anchor нужно проверить заново.
+
+Proxy не читает SQLite и durable ingress spool автоматически: их high-water —
+operator input при проверке или создании seed. Seed восстанавливает только
+проверенный local affine bridge; cloud cursor и выданные batch остаются в RAM.
+
+## Границы текущей версии
+
+- Native↔virtual mapping и cloud cursor не являются durable ACK-aware state.
+- Повтор после потерянного HTTP-ответа не гарантирует тот же batch с теми же
+  virtual IDs, а partial ACK не хранится как отдельное pending-состояние.
+- Нет persistent fingerprint ledger для семантической дедупликации зеркальных
+  local/cloud updates.
+- Параллельные `getUpdates` одного bot пока не сериализуются внутри proxy.
+- Поэтому абсолютный exactly-once не заявляется; неизвестный cloud cursor по
+  умолчанию приводит к fail-closed ошибке, сохраняя cloud backlog нетронутым.
 
 ## Документация
 
 - [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) - архитектурный план.
 - [docs/token-migration.md](docs/token-migration.md) - переезд token между cloud/local/local.
-- [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, offset-файлов и логов.
+- [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, durable high-water и логов.
