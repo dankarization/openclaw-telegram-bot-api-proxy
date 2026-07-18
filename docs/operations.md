@@ -43,16 +43,33 @@ curl -sS "$CLOUD_API/bot$BOT_TOKEN/getWebhookInfo"
 curl -sS "$LOCAL_API/bot$BOT_TOKEN/getUpdates?timeout=0&limit=1"
 ```
 
-## OpenClaw offsets
+## OpenClaw offsets и durable high-water
 
-Proxy сверяет local updates с offset-файлами OpenClaw.
+Legacy-инсталляции OpenClaw могут хранить offset-файлы:
 
 ```bash
 find telegram -maxdepth 1 -name 'update-offset-*.json' -print
 sed -n '1,120p' telegram/update-offset-default.json
 ```
 
-В offset-файле важны `botId` и `lastUpdateId`.
+В новых версиях ACK cursor находится в SQLite namespace
+`telegram.update-offsets`, а принятые event IDs — в durable ingress spool.
+Проверяйте оба источника перед созданием или перепривязкой
+`LOCAL_UPDATE_STATE_SEED`.
+
+Для нового anchor `botId:localFloor:virtualFloor`:
+
+1. `localFloor` должен быть текущим native local tail.
+2. `virtualFloor` должен быть не ниже максимального virtual ID, когда-либо
+   записанного в durable ingress spool.
+3. Нельзя использовать только persisted `lastUpdateId`: ACK-aware watermark
+   может отставать после handler timeout.
+4. Убедитесь, что следующий native update получит virtual ID строго выше
+   durable high-water.
+
+Нарушение этого инварианта не обязательно даёт ошибку: durable spool может
+выполнить `ON CONFLICT DO NOTHING` по старому event ID и молча отбросить новый
+payload ещё до маршрутизации по session/thread.
 
 ## Логи proxy
 
@@ -75,7 +92,7 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 - `action=virtualized-update-id` - cloud `update_id` поднят выше local offset.
 - `action=ack-dropped` - proxy подтвердил старые local updates, чтобы они не вернулись снова.
 - `action=fallback-blocked` - fallback запрещен политикой, например для `multipart/form-data`.
-- `localUpdateStateSeeds=` - число проверенных local bridge anchors, загруженных при startup; production restart с уже разошедшимися ID-space должен показывать ожидаемое ненулевое значение.
+- `localUpdateStateSeeds=` - число синтаксически проверенных local bridge anchors, загруженных при startup; это не доказывает, что anchor выше durable high-water.
 - `cause=` - вложенная причина Node `fetch`/socket ошибки, если она есть.
 - `dropped=` - proxy отфильтровал updates ниже OpenClaw offset.
 - `translated=yes` - cloud `update_id` виртуально поднят выше local offset.

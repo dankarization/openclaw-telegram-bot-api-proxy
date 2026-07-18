@@ -86,7 +86,7 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `LOCAL_API_ROOT` | `http://127.0.0.1:8081` | Локальный Docker Bot API. |
 | `CLOUD_API_ROOT` | `https://api.telegram.org` | Cloud Bot API. |
 | `ENABLE_CLOUD_FALLBACK` | `false` | Включить cloud fallback. |
-| `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог OpenClaw offset-файлов. |
+| `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог legacy OpenClaw offset-файлов; новые OpenClaw могут хранить offset в SQLite. |
 | `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
 | `FILE_INFO_CACHE_TTL_MS` | `300000` | TTL bot-scoped связи `file_path` с local/cloud источником `getFile`. |
 | `LOCAL_FILE_PATH_REWRITE_FROM` | пусто | Контейнерный префикс file_path из local Bot API. |
@@ -106,7 +106,7 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `CLOUD_PENDING_FALLBACK_DELAY_MS` | `60000` | Минимальный возраст cloud pending backlog для явно включённого empty-local rescue. |
 | `CLOUD_FRESH_UPDATE_MAX_AGE_MS` | `21600000` | Максимальный возраст cloud update для виртуального подъёма id. |
 | `LOCAL_VIRTUAL_OFFSET_SKEW_MIN` | `1000000` | Минимальный разрыв между OpenClaw offset и local `update_id`, при котором proxy считает id разными пространствами и мостит local updates в виртуальную шкалу. |
-| `LOCAL_UPDATE_STATE_SEED` | пусто | Необязательные `botId:localFloor:virtualFloor` anchors через запятую для продолжения уже известного affine local bridge после restart; значения не содержат token. |
+| `LOCAL_UPDATE_STATE_SEED` | пусто | Необязательные `botId:localFloor:virtualFloor` anchors через запятую для продолжения уже известного affine local bridge после restart; для нового anchor нужен durable global high-water, а не отстающий ACK cursor. Значения не содержат token. |
 
 ## OpenClaw
 
@@ -118,17 +118,33 @@ systemd/openclaw-telegram-api-proxy.service.example
 }
 ```
 
-Proxy использует offset-файлы OpenClaw:
+Старые версии OpenClaw использовали offset-файлы:
 
 ```text
 telegram/update-offset-default.json
 telegram/update-offset-syncopia-guest-bot.json
 ```
 
-В файлах нужны `botId` и `lastUpdateId`.
+Текущие версии могут хранить ACK cursor в SQLite namespace
+`telegram.update-offsets`, а уже принятые event IDs — в durable ingress spool.
+ACK cursor может отставать от максимального когда-либо выданного virtual ID,
+например после handler timeout.
+
+При создании или перепривязке `LOCAL_UPDATE_STATE_SEED` берите одну парную
+точку affine mapping:
+
+- `localFloor` — текущий native local tail;
+- `virtualFloor` — global high-water всех уже выданных/записанных virtual IDs,
+  включая durable ingress spool, даже если persisted ACK cursor ниже.
+
+Если взять `virtualFloor` из отстающего ACK cursor или только из RAM proxy,
+новые updates могут получить уже существующие event IDs и будут дедуплицированы
+до маршрутизации. Проверенный старый anchor остаётся валиден между restart при
+монотонных local IDs и неизменном affine mapping; после cloud mapping или reset
+native ID anchor нужно проверить заново.
 
 ## Документация
 
 - [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) - архитектурный план.
 - [docs/token-migration.md](docs/token-migration.md) - переезд token между cloud/local/local.
-- [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, offset-файлов и логов.
+- [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, durable high-water и логов.

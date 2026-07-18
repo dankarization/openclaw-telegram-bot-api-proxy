@@ -456,11 +456,11 @@ test("bridged local polling does not re-deliver stale updates", async (t) => {
   assert.deepEqual(await getUpdates(harness.proxyRoot, token, 1001), []);
 });
 
-test("valid multi-bot bridge seeds survive restart without dropping the first update", async (t) => {
+test("a bridge seed can re-anchor above durable high-water with a stale client cursor", async (t) => {
   const token = "787878:seeded-bridge-secret-value-1234567890";
   const localOffsets = [];
   const harness = await startHarness(t, {
-    env: { LOCAL_UPDATE_STATE_SEED: "787878:5:1000,797979:9:2000" },
+    env: { LOCAL_UPDATE_STATE_SEED: "787878:5:1200,797979:9:2000" },
     local: (request) => {
       const health = healthyGetMe(request);
       if (health) return health;
@@ -476,7 +476,10 @@ test("valid multi-bot bridge seeds survive restart without dropping the first up
     cloud: (request) => healthyGetMe(request),
   });
 
-  assert.deepEqual((await getUpdates(harness.proxyRoot, token, 1001)).map((update) => update.update_id), [1001]);
+  // The downstream ACK cursor may lag behind IDs already present in a durable
+  // ingress spool. The paired anchor must keep the native request at 6 while
+  // issuing the first new virtual ID above the durable high-water (1200).
+  assert.deepEqual((await getUpdates(harness.proxyRoot, token, 1001)).map((update) => update.update_id), [1201]);
   assert.deepEqual(localOffsets, ["6"]);
   assert.match(harness.output.value, /localUpdateStateSeeds=2/u);
 });
