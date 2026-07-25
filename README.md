@@ -215,5 +215,7 @@ operator input при проверке или создании seed. Seed вос
 ## Документация
 
 - [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) - архитектурный план.
+- [docs/durable-reconciliation-pr0.md](docs/durable-reconciliation-pr0.md) - PR 0: инварианты, simulator, storage spike и решения для durable state.
+- [docs/durable-state-schema-v1.sql](docs/durable-state-schema-v1.sql) - проверяемая SQLite schema будущего StateStore.
 - [docs/token-migration.md](docs/token-migration.md) - переезд token между cloud/local/local.
 - [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, durable high-water и логов.
