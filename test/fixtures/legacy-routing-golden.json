@@ -1,0 +1,23 @@
+{
+  "postJsonGetUpdates": {
+    "localRequests": [
+      {
+        "body": "",
+        "botId": "666666",
+        "method": "getMe",
+        "offset": null
+      },
+      {
+        "body": "{\"offset\":41,\"timeout\":0,\"allowed_updates\":[\"message\"]}",
+        "botId": "666666",
+        "method": "getUpdates",
+        "offset": null
+      }
+    ],
+    "cloudRequests": [],
+    "downstream": {
+      "body": "{\"ok\":true,\"result\":[{\"update_id\":41,\"message\":{\"message_id\":7,\"date\":1780000000,\"chat\":{\"id\":9},\"text\":\"golden\"}},{\"update_id\":42,\"callback_query\":{\"id\":\"callback-golden\"}}]}",
+      "status": 200
+    }
+  }
+}
