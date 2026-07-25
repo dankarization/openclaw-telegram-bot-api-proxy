@@ -1,5 +1,34 @@
 import { URL } from "node:url";
 
+const CANONICAL_METHOD_BY_LOWERCASE = new Map([
+  "getMe",
+  "getUpdates",
+  "getWebhookInfo",
+  "deleteWebhook",
+  "getFile",
+  "sendMessage",
+  "editMessageText",
+  "editMessageCaption",
+  "editMessageReplyMarkup",
+  "deleteMessage",
+  "answerCallbackQuery",
+  "sendChatAction",
+  "setMyCommands",
+  "deleteMyCommands",
+  "setMyDescription",
+  "setMyShortDescription",
+  "setMyName",
+  "setChatMenuButton",
+  "close",
+  "logOut",
+  "setWebhook",
+].map((method) => [method.toLowerCase(), method]));
+
+export function canonicalMethodName(method) {
+  const raw = String(method || "");
+  return CANONICAL_METHOD_BY_LOWERCASE.get(raw.toLowerCase()) || raw;
+}
+
 // Достаём bot token из Telegram API path вида /bot<TOKEN>/... или /file/bot<TOKEN>/....
 export function tokenFromPath(pathname) {
   const match = pathname.match(/^\/(?:file\/)?bot([^/]+)/u);
@@ -9,7 +38,7 @@ export function tokenFromPath(pathname) {
 // Нормализуем имя Telegram API метода одинаково для buffered и streaming путей.
 export function methodFromPath(pathname) {
   const botMatch = pathname.match(/^\/bot[^/]+\/([^/?#]+)/u);
-  if (botMatch) return botMatch[1] || "unknown";
+  if (botMatch) return canonicalMethodName(botMatch[1] || "unknown");
   if (pathname.startsWith("/file/bot")) return "file";
   return "unknown";
 }
@@ -180,7 +209,9 @@ export function requestWithUrl(req, reqUrl) {
 }
 
 export function applyGetUpdatesTimeoutCap(req, method, body, timeoutCapSeconds) {
-  if (method !== "getUpdates") return { req, body, capped: false, timeout: null };
+  if (canonicalMethodName(method) !== "getUpdates") {
+    return { req, body, capped: false, timeout: null };
+  }
   const currentTimeout = requestTimeoutValue(req, body);
   if (currentTimeout != null && currentTimeout <= timeoutCapSeconds) {
     return { req, body, capped: false, timeout: currentTimeout };

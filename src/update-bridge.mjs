@@ -2,6 +2,7 @@ import fsModule from "node:fs";
 
 import {
   bodyWithOffset,
+  canonicalMethodName,
   exactSafeNonNegativeInteger,
   numericOffset,
   requestOffsetFloor,
@@ -163,7 +164,7 @@ class LegacyUpdateBridge {
   }
 
   cloudRequestForGetUpdates(req, method, token, body, options = {}) {
-    if (method !== "getUpdates") {
+    if (canonicalMethodName(method) !== "getUpdates") {
       return { reqUrl: req.url, body, translated: false, blocked: false };
     }
     const botId = botIdFromToken(token);
@@ -202,7 +203,7 @@ class LegacyUpdateBridge {
   }
 
   localRequestForGetUpdates(req, method, token, body) {
-    if (method !== "getUpdates") {
+    if (canonicalMethodName(method) !== "getUpdates") {
       return { req: requestWithUrl(req, req.url), body, translated: false };
     }
     const botId = botIdFromToken(token);
@@ -298,7 +299,11 @@ class LegacyUpdateBridge {
   }
 
   guardedCloudGetUpdates(req, method, token, body, upstream, options = {}) {
-    if (method !== "getUpdates" || upstream.statusCode !== 200 || !upstream.body?.length) {
+    if (
+      canonicalMethodName(method) !== "getUpdates"
+      || upstream.statusCode !== 200
+      || !upstream.body?.length
+    ) {
       return { upstream, dropped: 0, floor: null, translated: false };
     }
 
@@ -455,7 +460,11 @@ class LegacyUpdateBridge {
   }
 
   emptySuccessfulGetUpdates(method, upstream) {
-    if (method !== "getUpdates" || upstream.statusCode !== 200 || !upstream.body?.length) {
+    if (
+      canonicalMethodName(method) !== "getUpdates"
+      || upstream.statusCode !== 200
+      || !upstream.body?.length
+    ) {
       return false;
     }
     try {
@@ -550,7 +559,11 @@ class LegacyUpdateBridge {
   }
 
   guardedLocalGetUpdates(req, method, token, body, upstream) {
-    if (method !== "getUpdates" || upstream.statusCode !== 200 || !upstream.body?.length) {
+    if (
+      canonicalMethodName(method) !== "getUpdates"
+      || upstream.statusCode !== 200
+      || !upstream.body?.length
+    ) {
       return {
         upstream,
         dropped: 0,

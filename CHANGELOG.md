@@ -10,6 +10,12 @@
 - Serialize the complete `getUpdates` cycle in a FIFO lane per bot ID while
   preserving cross-bot concurrency. Queued client cancellations are removed;
   an already-started ambiguous upstream cycle keeps its lane until completion.
+- Canonicalize Telegram's case-insensitive method names before routing, so
+  variants such as `GETUPDATES`, `GETFILE`, and `SETWEBHOOK` cannot bypass
+  cursor guards, coordination, or local-only policy.
+- Buffer bounded `getUpdates` request bodies before lane acquisition, preventing
+  incomplete unauthenticated bodies from starving a bot lane; keep the legacy
+  health decision at response headers without buffering a `getMe` body.
 - Extract request parsing, fallback policy, file routing, legacy update
   bridging, and upstream transport into independently tested modules with an
   injectable clock and fault points.

@@ -6,6 +6,7 @@ import {
   bodyWithOffset,
   bodyWithOffsetAndTimeout,
   bodyWithTimeout,
+  canonicalMethodName,
   canBufferRequest,
   contentType,
   copyHeaders,
@@ -41,9 +42,14 @@ test("Telegram path helpers preserve token, method, and decoded file path behavi
   assert.equal(tokenFromPath("/health"), "");
 
   assert.equal(methodFromPath("/bot123:secret/getUpdates"), "getUpdates");
+  assert.equal(methodFromPath("/bot123:secret/GETUPDATES"), "getUpdates");
+  assert.equal(methodFromPath("/bot123:secret/gEtFiLe"), "getFile");
+  assert.equal(methodFromPath("/bot123:secret/SETWEBHOOK"), "setWebhook");
   assert.equal(methodFromPath("/bot123:secret/sendMessage?chat_id=1"), "sendMessage");
   assert.equal(methodFromPath("/file/bot123:secret/voice/a.ogg"), "file");
   assert.equal(methodFromPath("/bot123:secret/"), "unknown");
+  assert.equal(canonicalMethodName("LOGOUT"), "logOut");
+  assert.equal(canonicalMethodName("customMethod"), "customMethod");
 
   assert.equal(filePathFromPathname("/file/bot123:secret/folder%20name/a.ogg"), "folder name/a.ogg");
   assert.equal(filePathFromPathname("/file/bot123:secret/bad%E0%A4%A"), "bad%E0%A4%A");

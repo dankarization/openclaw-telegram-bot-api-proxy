@@ -12,6 +12,32 @@ function request(options = {}) {
   };
 }
 
+test("health probe decides on headers and cancels an unbounded body", async () => {
+  let cancelled = false;
+  const client = createUpstreamClient({
+    upstreamTimeoutMs: 1000,
+    fetchImpl: async () => new Response(new ReadableStream({
+      cancel() {
+        cancelled = true;
+      },
+      start(controller) {
+        controller.enqueue(Buffer.from("first-chunk"));
+      },
+    }), { status: 200 }),
+  });
+
+  assert.deepEqual(
+    await client.probeUpstream(
+      "http://upstream.test",
+      "/bot1:x/getMe",
+      { method: "getMe", target: "local" },
+    ),
+    { statusCode: 200 },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelled, true);
+});
+
 test("buffered client preserves request/response bytes and exposes token-free fault context", async () => {
   const calls = [];
   const hooks = createRuntimeHooks({

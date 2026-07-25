@@ -210,7 +210,7 @@ test("cloud requests fail closed without a cursor and bootstrap only at explicit
 
   const bootstrap = instance.cloudRequestForGetUpdates(
     req,
-    "getUpdates",
+    "GETUPDATES",
     "123:secret",
     body,
     { bootstrapNativeOffset: true },

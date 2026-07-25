@@ -16,6 +16,40 @@ export function createUpstreamClient(options = {}) {
   const httpsModule = options.httpsModule || https;
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? 130_000;
 
+  async function probeUpstream(root, reqUrl, requestOptions = {}) {
+    const controller = new AbortController();
+    const timeoutMs = requestOptions.timeoutMs ?? upstreamTimeoutMs;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    timeout.unref?.();
+    const traceContext = {
+      method: requestOptions.method || "unknown",
+      target: requestOptions.target || "unknown",
+    };
+    try {
+      const signal = requestOptions.signal
+        ? AbortSignal.any([requestOptions.signal, controller.signal])
+        : controller.signal;
+      await hooks.fault("before-upstream-request", traceContext);
+      const response = await fetchImpl(`${root}${reqUrl}`, {
+        method: "GET",
+        signal,
+      });
+      try {
+        const cancellation = response.body?.cancel();
+        void cancellation?.catch(() => {});
+      } catch {
+        // Health is decided by response headers, matching the legacy probe.
+      }
+      await hooks.fault("after-upstream-response", {
+        ...traceContext,
+        statusCode: response.status,
+      });
+      return { statusCode: response.status };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async function forwardBuffered(req, root, body, reqUrl = req.url, requestOptions = {}) {
     const url = `${root}${reqUrl}`;
     const controller = new AbortController();
@@ -118,5 +152,6 @@ export function createUpstreamClient(options = {}) {
   return Object.freeze({
     forwardBuffered,
     forwardStreaming,
+    probeUpstream,
   });
 }

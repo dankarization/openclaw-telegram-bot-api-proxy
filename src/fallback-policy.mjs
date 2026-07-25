@@ -1,4 +1,7 @@
-import { isMultipartUploadRequest } from "./request-parsing.mjs";
+import {
+  canonicalMethodName,
+  isMultipartUploadRequest,
+} from "./request-parsing.mjs";
 
 // Служебные методы local/cloud Bot API, которые не отправляют пользовательский контент.
 const localAdminMethods = new Set([
@@ -57,26 +60,28 @@ export class FallbackPolicy {
   }
 
   isSafeMethodForStatusFallback(method) {
-    return safeCloudFallbackMethods.has(method);
+    return safeCloudFallbackMethods.has(canonicalMethodName(method));
   }
 
   shouldRetryCloudAfterLocalStatus(method, statusCode) {
+    const canonicalMethod = canonicalMethodName(method);
     if (
       (statusCode === 401 || statusCode === 404)
-      && method !== "getUpdates"
+      && canonicalMethod !== "getUpdates"
     ) {
       return true;
     }
-    if (method === "getFile" && statusCode === 400) return true;
+    if (canonicalMethod === "getFile" && statusCode === 400) return true;
     return false;
   }
 
   cloudFallbackPolicy(method, token, pathname = "", req = null) {
+    const canonicalMethod = canonicalMethodName(method);
     if (!this.#cloudFallbackEnabled) {
       return { allowed: false, reason: "fallback-disabled" };
     }
     if (
-      method === "getUpdates"
+      canonicalMethod === "getUpdates"
       && !this.#cloudGetUpdatesFallbackEnabled
     ) {
       return {
@@ -84,15 +89,15 @@ export class FallbackPolicy {
         reason: "cloud-getupdates-fallback-disabled",
       };
     }
-    if (localOnlyMethods.has(method)) {
+    if (localOnlyMethods.has(canonicalMethod)) {
       return { allowed: false, reason: "local-only-method" };
     }
     if (req && isMultipartUploadRequest(req)) {
       return { allowed: false, reason: "multipart-upload-local-only" };
     }
 
-    if (method !== "file") {
-      if (safeCloudFallbackMethods.has(method)) {
+    if (canonicalMethod !== "file") {
+      if (safeCloudFallbackMethods.has(canonicalMethod)) {
         return { allowed: true, reason: "safe-method" };
       }
       return { allowed: true, reason: "default-non-file-method" };

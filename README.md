@@ -56,6 +56,9 @@ sequenceDiagram
   check, local retries, stale-update guard, служебный `ack-dropped`, cloud probe
   и fallback остаются под одним FIFO lock. Разные боты продолжают polling
   параллельно.
+- Имена Bot API методов нормализуются без учёта регистра до выбора policy:
+  `GETUPDATES`, `GETFILE` и `SETWEBHOOK` не обходят cursor guard, file routing
+  или local-only ограничения.
 - Длительность long poll для local `getUpdates` ограничивается
   `LOCAL_GETUPDATES_TIMEOUT_SECONDS`; значение `0` отключает long poll и
   превращает его в short polling.

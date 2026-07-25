@@ -7,6 +7,8 @@ import net from "node:net";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { canonicalMethodName } from "../src/request-parsing.mjs";
+
 const PROXY_ENTRYPOINT = process.env.PROXY_ENTRYPOINT_OVERRIDE
   ? pathToFileURL(process.env.PROXY_ENTRYPOINT_OVERRIDE)
   : new URL("../src/telegram-bot-api-proxy.mjs", import.meta.url);
@@ -47,8 +49,9 @@ async function startUpstream(handler) {
     const request = {
       body: Buffer.concat(chunks),
       botId: String(match?.[1] || "").split(":", 1)[0],
-      method: match?.[2] || "unknown",
+      method: canonicalMethodName(match?.[2] || "unknown"),
       offset: url.searchParams.get("offset"),
+      rawMethod: match?.[2] || "unknown",
       token: match?.[1] || "",
     };
     requests.push(request);
@@ -150,7 +153,8 @@ async function startHarness(t, localHandler, env = {}) {
 }
 
 async function poll(proxyRoot, token, options = {}) {
-  const response = await fetch(`${proxyRoot}/bot${token}/getUpdates?offset=1`, {
+  const apiMethod = options.apiMethod || "getUpdates";
+  const response = await fetch(`${proxyRoot}/bot${token}/${apiMethod}?offset=1`, {
     signal: options.signal,
   });
   return { payload: await response.json(), status: response.status };
@@ -180,7 +184,7 @@ test("same-bot long polls are serialized before the upstream can return 409", as
 
   const [first, second] = await Promise.all([
     poll(harness.proxyRoot, token),
-    poll(harness.proxyRoot, token),
+    poll(harness.proxyRoot, token, { apiMethod: "GETUPDATES" }),
   ]);
 
   assert.deepEqual([first.status, second.status], [200, 200]);
@@ -191,6 +195,31 @@ test("same-bot long polls are serialized before the upstream can return 409", as
     "start:111111",
     "end:111111",
   ]);
+});
+
+test("uppercase getUpdates keeps fail-closed cursor protection", async (t) => {
+  const harness = await startHarness(t, async (request) => {
+    if (request.method === "getMe" || request.method === "getUpdates") {
+      return { disconnect: true };
+    }
+    return null;
+  }, {
+    ENABLE_CLOUD_GETUPDATES_FALLBACK: "1",
+  });
+
+  const response = await fetch(
+    `${harness.proxyRoot}/bot121212:case-secret/GETUPDATES?offset=999999`,
+  );
+  assert.equal(response.status, 502);
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getUpdates").length,
+    0,
+  );
+  await waitForOutput(
+    harness.child,
+    harness.output,
+    "fallbackReason=cloud-cursor-uninitialized",
+  );
 });
 
 test("different bot IDs keep independent long polls", async (t) => {
@@ -215,6 +244,46 @@ test("different bot IDs keep independent long polls", async (t) => {
   assert.equal(maxActive, 2);
   release.resolve();
   assert.deepEqual((await Promise.all([first, second])).map((result) => result.status), [200, 200]);
+});
+
+test("an incomplete request body does not acquire the bot lane", async (t) => {
+  let pollCalls = 0;
+  const harness = await startHarness(t, async (request) => {
+    if (request.method === "getMe") {
+      return json(200, { ok: true, result: { id: Number(request.botId) } });
+    }
+    if (request.method === "getUpdates") {
+      pollCalls += 1;
+      return json(200, { ok: true, result: [] });
+    }
+    return null;
+  });
+  const proxyUrl = new URL(harness.proxyRoot);
+  const partial = net.createConnection({
+    host: proxyUrl.hostname,
+    port: Number(proxyUrl.port),
+  });
+  t.after(() => partial.destroy());
+  partial.on("error", () => {});
+  await once(partial, "connect");
+  partial.write([
+    "POST /bot343434:slow-body-secret/getUpdates HTTP/1.1",
+    `Host: ${proxyUrl.host}`,
+    "Content-Type: application/json",
+    "Content-Length: 1000",
+    "",
+    "{\"offset\":",
+  ].join("\r\n"));
+
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const valid = await poll(
+    harness.proxyRoot,
+    "343434:slow-body-secret",
+    { apiMethod: "GETUPDATES" },
+  );
+  assert.equal(valid.status, 200);
+  assert.equal(pollCalls, 1);
+  partial.destroy();
 });
 
 test("a queued client disconnect is removed without reaching upstream", async (t) => {

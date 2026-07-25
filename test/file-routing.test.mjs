@@ -41,7 +41,7 @@ test("local getFile rewrites the path and keeps both local aliases local", () =>
     fileSize: 1024,
   });
   const processed = router.processGetFileResult(
-    "getFile",
+    "GETFILE",
     token,
     upstream,
     "local",

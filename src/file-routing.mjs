@@ -1,4 +1,5 @@
 import {
+  canonicalMethodName,
   filePathFromPathname,
   numericOffset,
 } from "./request-parsing.mjs";
@@ -61,7 +62,7 @@ export class FileRouter {
 
   processGetFileResult(method, token, upstream, target) {
     if (
-      method !== "getFile"
+      canonicalMethodName(method) !== "getFile"
       || upstream.statusCode !== 200
       || !upstream.body?.length
     ) {

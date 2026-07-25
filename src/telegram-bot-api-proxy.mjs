@@ -124,6 +124,7 @@ const pollCoordinator = new PerBotPollCoordinator({
 const {
   forwardBuffered,
   forwardStreaming,
+  probeUpstream,
 } = createUpstreamClient({
   hooks: runtimeHooks,
   upstreamTimeoutMs,
@@ -313,11 +314,9 @@ async function checkLocalHealth(token, signal) {
   if (!token) return true;
 
   try {
-    await forwardBuffered(
-      { method: "GET", headers: {}, url: `/bot${token}/getMe` },
+    await probeUpstream(
       localRoot,
-      Buffer.alloc(0),
-      undefined,
+      `/bot${token}/getMe`,
       {
         method: "getMe",
         signal,
@@ -452,7 +451,7 @@ function writeBufferedResponse(res, upstream) {
 
 async function handleBuffered(req, res, method, token, startedAt, options = {}) {
   const signal = options.signal;
-  const body = await readRequestBody(req);
+  const body = options.body ?? await readRequestBody(req);
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
   const localIsHealthy = await checkLocalHealth(token, signal);
   const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
@@ -656,10 +655,20 @@ const server = http.createServer(async (req, res) => {
   res.once("close", abortClosedResponse);
   try {
     if (method === "getUpdates") {
+      // Buffer before lane acquisition: an incomplete or unauthenticated body
+      // must not starve every valid poll for the public bot ID.
+      const body = await readRequestBody(req);
       const botKey = botIdFromToken(token) || "unknown";
       await pollCoordinator.run(
         botKey,
-        ({ signal }) => handleBuffered(req, res, method, token, startedAt, { signal }),
+        ({ signal }) => handleBuffered(
+          req,
+          res,
+          method,
+          token,
+          startedAt,
+          { body, signal },
+        ),
         { signal: clientController.signal },
       );
     } else if (canBufferRequest(req, bufferLimitBytes)) {

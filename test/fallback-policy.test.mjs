@@ -60,7 +60,7 @@ test("global and getUpdates flags keep their legacy precedence", () => {
   });
   assert.deepEqual(
     getUpdatesDisabled.cloudFallbackPolicy(
-      "getUpdates",
+      "GETUPDATES",
       "111111:secret",
     ),
     {
@@ -85,7 +85,7 @@ test("local-only methods precede multipart and safe/default routing", () => {
     },
   };
 
-  for (const method of ["close", "logOut", "logout", "setWebhook"]) {
+  for (const method of ["close", "logOut", "logout", "setWebhook", "SETWEBHOOK", "LOGOUT"]) {
     assert.deepEqual(
       policy.cloudFallbackPolicy(
         method,
