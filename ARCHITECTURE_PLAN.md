@@ -272,8 +272,9 @@ Nginx пример дает несколько полезных настроек
   транзакционном persistent store.
 - Повторять тот же batch с теми же virtual IDs после потерянного HTTP-ответа.
 - Продвигать upstream native cursor только после следующего downstream ACK.
-- Сериализовать `getUpdates` отдельно для каждого bot, чтобы параллельные polls
-  не конфликтовали и не опережали ACK.
+- ~~Сериализовать полный `getUpdates` cycle отдельно для каждого bot ID, чтобы
+  параллельные polls одного процесса не конфликтовали и не опережали ACK.~~
+  Межпроцессная защита появится позже через durable lease.
 - Дедуплицировать зеркальные local/cloud updates по стабильному fingerprint без
   `update_id`, сохраняя committed ledger дольше максимального cloud backlog.
 - Инициализировать неизвестный cloud cursor через неразрушающий `offset=0`
@@ -288,8 +289,10 @@ Nginx пример дает несколько полезных настроек
 - Если proxy начнет fallback-ить multipart/upload в cloud, большие файлы будут ломаться и могут создавать дубли side effects.
 - Текущий native↔virtual bridge хранит runtime-state в RAM и восстанавливается
   operator-provided anchor. До реализации durable ACK-aware state потерянный
-  ответ, partial ACK, restart или параллельные polls могут привести к дублю,
-  пропуску или `409`.
+  ответ, partial ACK или restart могут привести к дублю или пропуску.
+- Per-bot coordinator устраняет same-process overlap. Второй proxy, прямой
+  `getUpdates` consumer или webhook остаются вне process-local lock и могут
+  привести к `409`; PR 2 должен добавить lease до включения durable state.
 - Без стабильного cross-source fingerprint нельзя надёжно отличить свежую
   cloud-копию уже обработанного local update от нового события. Поэтому
   неизвестный cloud cursor по умолчанию закрывается ошибкой.

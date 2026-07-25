@@ -7,6 +7,15 @@
   spike, crash/backup probes, and frozen ACK/replay invariants.
 - Declare Node `>=22.16.0 <23`, matching the releases that expose the selected
   built-in `node:sqlite.backup` API throughout the supported range.
+- Serialize the complete `getUpdates` cycle in a FIFO lane per bot ID while
+  preserving cross-bot concurrency. Queued client cancellations are removed;
+  an already-started ambiguous upstream cycle keeps its lane until completion.
+- Extract request parsing, fallback policy, file routing, legacy update
+  bridging, and upstream transport into independently tested modules with an
+  injectable clock and fault points.
+- Add frozen sequential routing traces and concurrency regressions covering
+  same-bot overlap, cross-bot parallelism, cancellation, shutdown, and
+  multipart local-only behavior.
 - Fallback `getFile` to cloud when local Bot API returns `400`, covering cloud
   fallback updates whose `file_id` is not known by the local API yet.
 - Bridge/virtualize local `update_id` values after cloud `getUpdates` fallback

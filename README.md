@@ -52,6 +52,10 @@ sequenceDiagram
 - Локальный Bot API всегда в приоритете.
 - Local `getUpdates` перед fallback ретраится несколько раз; краткий обрыв
   HTTP-соединения не должен валить Telegram provider.
+- Полный `getUpdates` cycle сериализуется отдельно для каждого bot ID: health
+  check, local retries, stale-update guard, служебный `ack-dropped`, cloud probe
+  и fallback остаются под одним FIFO lock. Разные боты продолжают polling
+  параллельно.
 - Длительность long poll для local `getUpdates` ограничивается
   `LOCAL_GETUPDATES_TIMEOUT_SECONDS`; значение `0` отключает long poll и
   превращает его в short polling.
@@ -209,7 +213,9 @@ operator input при проверке или создании seed. Seed вос
   virtual IDs, а partial ACK не хранится как отдельное pending-состояние.
 - Нет persistent fingerprint ledger для семантической дедупликации зеркальных
   local/cloud updates.
-- Параллельные `getUpdates` одного bot пока не сериализуются внутри proxy.
+- Per-bot coordinator предотвращает конкурирующие polls только внутри одного
+  процесса proxy. Второй proxy, прямой consumer или webhook остаются внешними
+  конкурентами и всё ещё могут вызвать Telegram `409`.
 - Поэтому абсолютный exactly-once не заявляется; неизвестный cloud cursor по
   умолчанию приводит к fail-closed ошибке, сохраняя cloud backlog нетронутым.
 
@@ -217,6 +223,7 @@ operator input при проверке или создании seed. Seed вос
 
 - [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) - архитектурный план.
 - [docs/durable-reconciliation-pr0.md](docs/durable-reconciliation-pr0.md) - PR 0: инварианты, simulator, storage spike и решения для durable state.
+- [docs/per-bot-poll-coordinator.md](docs/per-bot-poll-coordinator.md) - PR 1: границы lock, cancellation и differential gates.
 - [docs/durable-state-schema-v1.sql](docs/durable-state-schema-v1.sql) - проверяемая SQLite schema будущего StateStore.
 - [docs/token-migration.md](docs/token-migration.md) - переезд token между cloud/local/local.
 - [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, durable high-water и логов.

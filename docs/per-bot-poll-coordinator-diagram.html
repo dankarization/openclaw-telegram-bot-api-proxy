@@ -1,0 +1,177 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Per-bot getUpdates coordinator</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f8fafc;
+    --fg: #172033;
+    --muted: #5b6475;
+    --line: #64748b;
+    --neutral: #e2e8f0;
+    --input: #bfdbfe;
+    --process: #c7d2fe;
+    --storage: #99f6e4;
+    --external: #fde68a;
+    --risk: #fecaca;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f172a;
+      --fg: #e5e7eb;
+      --muted: #a3adbd;
+      --line: #94a3b8;
+      --neutral: #334155;
+      --input: #1d4ed8;
+      --process: #4338ca;
+      --storage: #0f766e;
+      --external: #92400e;
+      --risk: #991b1b;
+    }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font:
+      14px/1.4 ui-sans-serif,
+      system-ui,
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      sans-serif;
+  }
+  main {
+    max-width: 1100px;
+    margin: 32px auto;
+    padding: 0 20px;
+  }
+  svg {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+  .title {
+    font-size: 20px;
+    font-weight: 650;
+    fill: var(--fg);
+  }
+  .label {
+    font-size: 14px;
+    font-weight: 600;
+    fill: var(--fg);
+  }
+  .small {
+    font-size: 12px;
+    fill: var(--muted);
+  }
+  .node {
+    stroke: var(--line);
+    stroke-width: 1;
+  }
+  .neutral {
+    fill: var(--neutral);
+  }
+  .input {
+    fill: var(--input);
+  }
+  .process {
+    fill: var(--process);
+  }
+  .storage {
+    fill: var(--storage);
+  }
+  .external {
+    fill: var(--external);
+  }
+  .risk {
+    fill: var(--risk);
+  }
+  .edge {
+    stroke: var(--line);
+    stroke-width: 1.5;
+    fill: none;
+  }
+  .zone {
+    fill: none;
+    stroke: var(--line);
+    stroke-width: 1;
+    stroke-dasharray: 6 5;
+    opacity: 0.8;
+  }
+</style>
+<main>
+  <svg viewBox="0 0 1100 650" role="img" aria-labelledby="diagram-title diagram-description">
+    <title id="diagram-title">Per-bot getUpdates coordinator</title>
+    <desc id="diagram-description">
+      Two requests for bot A share a FIFO lane while bot B runs in parallel.
+      A second proxy or direct consumer bypasses the process-local coordinator.
+    </desc>
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line)" />
+      </marker>
+    </defs>
+
+    <text x="40" y="42" class="title">Process-local FIFO ownership for getUpdates</text>
+    <text x="40" y="68" class="small">One active full cycle per bot ID; independent bots remain concurrent</text>
+
+    <rect x="270" y="92" width="520" height="452" rx="18" class="zone" />
+    <text x="294" y="122" class="label">One proxy process</text>
+
+    <!-- Directed connectors are drawn before nodes. -->
+    <path d="M 190 180 H 320" class="edge" marker-end="url(#arrow)" />
+    <path d="M 190 275 H 320" class="edge" marker-end="url(#arrow)" />
+    <path d="M 190 420 H 320" class="edge" marker-end="url(#arrow)" />
+    <path d="M 500 180 H 590" class="edge" marker-end="url(#arrow)" />
+    <path d="M 500 420 H 590" class="edge" marker-end="url(#arrow)" />
+    <path d="M 750 180 H 880" class="edge" marker-end="url(#arrow)" />
+    <path d="M 750 420 H 880" class="edge" marker-end="url(#arrow)" />
+    <path d="M 995 570 V 500" class="edge" marker-end="url(#arrow)" />
+
+    <rect x="40" y="140" width="150" height="80" rx="12" class="node input" />
+    <text x="64" y="174" class="label">Bot A poll 1</text>
+    <text x="64" y="198" class="small">starts active cycle</text>
+
+    <rect x="40" y="235" width="150" height="80" rx="12" class="node input" />
+    <text x="64" y="269" class="label">Bot A poll 2</text>
+    <text x="64" y="293" class="small">waits in FIFO</text>
+
+    <rect x="40" y="380" width="150" height="80" rx="12" class="node input" />
+    <text x="64" y="414" class="label">Bot B poll</text>
+    <text x="64" y="438" class="small">runs independently</text>
+
+    <rect x="320" y="140" width="180" height="175" rx="12" class="node process" />
+    <text x="344" y="174" class="label">Bot A lane</text>
+    <text x="344" y="204" class="small">active: poll 1</text>
+    <text x="344" y="228" class="small">queued: poll 2</text>
+    <text x="344" y="266" class="small">health → retries → bridge</text>
+    <text x="344" y="288" class="small">ACK → fallback → response</text>
+
+    <rect x="320" y="380" width="180" height="80" rx="12" class="node process" />
+    <text x="344" y="414" class="label">Bot B lane</text>
+    <text x="344" y="438" class="small">active concurrently</text>
+
+    <rect x="590" y="140" width="160" height="80" rx="12" class="node storage" />
+    <text x="614" y="174" class="label">Full cycle A</text>
+    <text x="614" y="198" class="small">lock held to terminal state</text>
+
+    <rect x="590" y="380" width="160" height="80" rx="12" class="node storage" />
+    <text x="614" y="414" class="label">Full cycle B</text>
+    <text x="614" y="438" class="small">parallel with cycle A</text>
+
+    <rect x="880" y="140" width="170" height="320" rx="12" class="node external" />
+    <text x="910" y="184" class="label">Telegram upstreams</text>
+    <text x="910" y="220" class="small">Local Bot API</text>
+    <text x="910" y="246" class="small">Cloud Bot API</text>
+    <text x="910" y="294" class="small">Same-process Bot A</text>
+    <text x="910" y="316" class="small">active count ≤ 1</text>
+    <text x="910" y="364" class="small">Bot B may remain</text>
+    <text x="910" y="386" class="small">active in parallel</text>
+
+    <rect x="850" y="570" width="200" height="60" rx="12" class="node risk" />
+    <text x="874" y="596" class="label">External competitor</text>
+    <text x="874" y="616" class="small">second proxy / direct poll / webhook</text>
+  </svg>
+</main>
