@@ -109,7 +109,8 @@ Multipart upload через cloud никогда автоматически не
 
 ## Требования
 
-- Node.js 22+
+- Node.js `>=22.16.0 <23` (`node:sqlite.backup` is unavailable earlier in
+  Node 22 and in Node 23 before 23.8.0)
 - Docker-контейнер `aiogram/telegram-bot-api:latest` на `127.0.0.1:8081`
 - Docker Compose v2 для `docker-compose.example.yml`
 - OpenClaw Telegram `apiRoot`: `http://127.0.0.1:8082`

@@ -1,5 +1,18 @@
-import { chmodSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  fstatSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { backup as sqliteBackup, DatabaseSync } from "node:sqlite";
+import path from "node:path";
 
 import {
   assertStorageAdapter,
@@ -20,6 +33,10 @@ function normalizeRow(row) {
   return row == null ? row : { ...row };
 }
 
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 class NodeSqliteConnection {
   constructor(databasePath) {
     this.databasePath = databasePath;
@@ -37,6 +54,7 @@ class NodeSqliteConnection {
     }
     database.exec(`
       PRAGMA foreign_keys = ON;
+      PRAGMA recursive_triggers = ON;
       PRAGMA synchronous = FULL;
       PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};
     `);
@@ -90,14 +108,80 @@ class NodeSqliteConnection {
 export const nodeSqliteAdapter = assertStorageAdapter({
   name: "node:sqlite",
 
-  async backup(connection, destinationPath) {
+  async backup(connection, destinationPath, options = {}) {
     assertStorageConnection(connection, "node:sqlite");
     if (!(connection instanceof NodeSqliteConnection)) {
       throw new TypeError("node:sqlite backup requires a node:sqlite connection");
     }
-    const copiedPages = await sqliteBackup(connection[RAW_DATABASE], destinationPath);
-    chmodSync(destinationPath, 0o600);
-    return copiedPages;
+    if (typeof destinationPath !== "string" || !path.isAbsolute(destinationPath)) {
+      throw new TypeError("node:sqlite backup destination must be an absolute path");
+    }
+    const absoluteDestination = path.resolve(destinationPath);
+    const parentDirectory = realpathSync(path.dirname(absoluteDestination));
+    const parentStat = statSync(parentDirectory);
+    const parentMode = parentStat.mode & 0o777;
+    if (
+      typeof process.geteuid === "function"
+      && parentStat.uid !== process.geteuid()
+    ) {
+      throw new Error("node:sqlite backup directory must be owned by the process user");
+    }
+    if ((parentMode & 0o077) !== 0) {
+      throw new Error(
+        `node:sqlite backup directory must be private (received mode ${parentMode.toString(8)})`,
+      );
+    }
+    const finalPath = path.join(parentDirectory, path.basename(absoluteDestination));
+    const stagingPath = path.join(
+      parentDirectory,
+      `.${path.basename(absoluteDestination)}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    let descriptor = openSync(stagingPath, "wx", 0o600);
+    let finalLinked = false;
+    try {
+      const openedIdentity = fstatSync(descriptor);
+      const copiedPages = await sqliteBackup(
+        connection[RAW_DATABASE],
+        `/proc/self/fd/${descriptor}`,
+        options,
+      );
+      fchmodSync(descriptor, 0o600);
+      const stagedIdentity = lstatSync(stagingPath);
+      if (!sameFileIdentity(openedIdentity, stagedIdentity)) {
+        throw new Error("node:sqlite backup staging identity changed");
+      }
+      linkSync(stagingPath, finalPath);
+      finalLinked = true;
+      const finalIdentity = lstatSync(finalPath);
+      if (!sameFileIdentity(openedIdentity, finalIdentity)) {
+        throw new Error("node:sqlite backup publication identity changed");
+      }
+      closeSync(descriptor);
+      descriptor = null;
+      unlinkSync(stagingPath);
+      return copiedPages;
+    } catch (error) {
+      if (descriptor != null) {
+        try {
+          closeSync(descriptor);
+        } catch {
+          // Preserve the original backup error.
+        }
+      }
+      if (finalLinked) {
+        try {
+          unlinkSync(finalPath);
+        } catch {
+          // Preserve the original backup error.
+        }
+      }
+      try {
+        unlinkSync(stagingPath);
+      } catch {
+        // Preserve the original backup error.
+      }
+      throw error;
+    }
   },
 
   open(databasePath) {

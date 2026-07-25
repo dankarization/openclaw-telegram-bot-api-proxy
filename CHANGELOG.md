@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add the production-neutral durable-reconciliation foundation: a Telegram
+  queue simulator, executable SQLite schema, driver-neutral storage/restore
+  spike, crash/backup probes, and frozen ACK/replay invariants.
+- Declare Node `>=22.16.0 <23`, matching the releases that expose the selected
+  built-in `node:sqlite.backup` API throughout the supported range.
 - Fallback `getFile` to cloud when local Bot API returns `400`, covering cloud
   fallback updates whose `file_id` is not known by the local API yet.
 - Bridge/virtualize local `update_id` values after cloud `getUpdates` fallback
