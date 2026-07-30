@@ -107,6 +107,77 @@ const cloudPendingProbeByBotId = new Map();
 // Последний ack старых local update_id, чтобы не долбить локальный Bot API одинаковым offset.
 const localDroppedAckByBotId = new Map();
 const seededLocalUpdateStateCount = seedLocalUpdateStates(localUpdateStateSeed);
+// Формы новых Telegram update логируем без содержимого: это позволяет заметить
+// неподдержанный API-тип, не записывая переписку в operational log.
+const observedInboundUpdateShapes = new Set();
+
+// Поля Message, которые OpenClaw уже умеет представить как текст либо медиа.
+const openClawReadableMessageFields = new Set([
+  "text", "caption", "rich_message", "photo", "audio", "document", "video",
+  "animation", "voice", "video_note", "sticker", "location", "contact", "venue",
+]);
+// Служебные поля Message; оставшиеся ключи — содержательный тип, который нельзя
+// молча потерять только потому, что текущая версия OpenClaw его ещё не рендерит.
+const telegramMessageEnvelopeFields = new Set([
+  "message_id", "message_thread_id", "from", "sender_chat", "sender_business_bot",
+  "date", "chat", "business_connection_id", "is_from_offline", "reply_to_message",
+  "external_reply", "quote", "reply_to_story", "via_bot", "edit_date",
+  "has_protected_content", "is_automatic_forward", "forward_origin", "forward_date",
+  "forward_from", "forward_from_chat", "forward_from_message_id", "forward_signature",
+  "media_group_id", "author_signature", "entities", "caption_entities",
+  "link_preview_options", "effect_id", "reply_markup", "boost_added",
+]);
+
+function logInboundUpdateShape(source, update) {
+  const types = Object.keys(update || {}).filter((key) => key !== "update_id").sort();
+  const message = update?.message ?? update?.business_message ?? update?.guest_message;
+  const messageFields = message && typeof message === "object"
+    ? Object.keys(message).filter((key) => !telegramMessageEnvelopeFields.has(key)).sort()
+    : [];
+  const shape = `source=${source} update=${types.join(",") || "empty"} message=${messageFields.join(",") || "none"}`;
+  if (observedInboundUpdateShapes.has(shape)) return;
+  observedInboundUpdateShapes.add(shape);
+  log(`method=getUpdates action=inbound-update-shape ${shape}`);
+}
+
+// grammY/OpenClaw currently installs a handler for ordinary `message`, while
+// Telegram also delivers Message-shaped business and guest updates. Preserve
+// their payload by presenting them as an ordinary message to that handler.
+// Existing `message` updates are left untouched except for a safe fallback for
+// a new content kind with no text/media renderer yet.
+function normalizeInboundUpdate(update, source) {
+  if (!update || typeof update !== "object" || Array.isArray(update)) return update;
+  let normalized = update;
+  if (!normalized.message && normalized.business_message && typeof normalized.business_message === "object") {
+    normalized = { ...normalized, message: normalized.business_message };
+  } else if (!normalized.message && normalized.guest_message && typeof normalized.guest_message === "object") {
+    normalized = { ...normalized, message: normalized.guest_message };
+  }
+
+  const message = normalized.message;
+  if (message && typeof message === "object" && !Array.isArray(message)) {
+    const contentFields = Object.keys(message)
+      .filter((key) => !telegramMessageEnvelopeFields.has(key))
+      .filter((key) => !openClawReadableMessageFields.has(key));
+    const hasReadableContent = Object.keys(message).some((key) => openClawReadableMessageFields.has(key));
+    if (!hasReadableContent && contentFields.length > 0) {
+      normalized = {
+        ...normalized,
+        message: {
+          ...message,
+          text: `[Telegram content received: ${contentFields.sort().join(", ")}]`,
+        },
+      };
+    }
+  }
+  logInboundUpdateShape(source, normalized);
+  return normalized;
+}
+
+function normalizeInboundUpdates(payload, source) {
+  if (!payload?.ok || !Array.isArray(payload.result)) return payload;
+  return { ...payload, result: payload.result.map((update) => normalizeInboundUpdate(update, source)) };
+}
 
 // Убираем завершающие слэши у root URL, чтобы дальше безопасно склеивать root + req.url.
 function trimRoot(value) {
@@ -599,7 +670,8 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
   }
 
   try {
-    const payload = JSON.parse(upstream.body.toString("utf8"));
+    const payload = normalizeInboundUpdates(JSON.parse(upstream.body.toString("utf8")), "cloud");
+    upstream = jsonCloudResponse(upstream, payload);
     if (!payload?.ok || !Array.isArray(payload.result)) return { upstream, dropped: 0, floor: null, translated: false };
 
     const botId = botIdFromToken(token);
@@ -798,7 +870,8 @@ function guardedLocalGetUpdates(req, method, token, body, upstream) {
     return { upstream, dropped: 0, floor: null, ackOffset: null, translated: false, bridged: false };
   }
   try {
-    const payload = JSON.parse(upstream.body.toString("utf8"));
+    const payload = normalizeInboundUpdates(JSON.parse(upstream.body.toString("utf8")), "local");
+    upstream = jsonCloudResponse(upstream, payload);
     if (!payload?.ok || !Array.isArray(payload.result)) {
       return { upstream, dropped: 0, floor: null, ackOffset: null, translated: false, bridged: false };
     }

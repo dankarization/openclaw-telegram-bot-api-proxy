@@ -436,6 +436,39 @@ test("bot-scoped affinity remains isolated under parallel requests without leaki
   assert.equal(harness.cloud.requests.filter((request) => request.kind === "file").length, 6);
 });
 
+test("getUpdates normalizes business and guest messages without logging their text", async (t) => {
+  const token = "766766:inbound-normalization-secret-value-1234567890";
+  const now = Math.floor(Date.now() / 1000);
+  const harness = await startHarness(t, {
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [
+            { update_id: 1001, business_message: { message_id: 1, date: now, chat: { id: 1 }, rich_message: { text: "business rich" } } },
+            { update_id: 1002, guest_message: { message_id: 2, date: now, chat: { id: 1 }, text: "guest text" } },
+            { update_id: 1003, message: { message_id: 3, date: now, chat: { id: 1 }, checklist: { title: "private checklist" } } },
+          ],
+        });
+      }
+      return null;
+    },
+    cloud: (request) => healthyGetMe(request),
+  });
+
+  const updates = await getUpdates(harness.proxyRoot, token, 1000);
+  assert.equal(updates.length, 3);
+  assert.deepEqual(updates[0].message, updates[0].business_message);
+  assert.deepEqual(updates[1].message, updates[1].guest_message);
+  assert.equal(updates[2].message.text, "[Telegram content received: checklist]");
+  await waitForOutput(harness.output, "action=inbound-update-shape source=local update=business_message,message");
+  assert.equal(harness.output.value.includes("business rich"), false);
+  assert.equal(harness.output.value.includes("guest text"), false);
+  assert.equal(harness.output.value.includes("private checklist"), false);
+});
+
 test("bridged local polling does not re-deliver stale updates", async (t) => {
   const token = "777777:bridge-secret-value-1234567890";
   const staleUpdate = { update_id: 5, message: { date: Math.floor(Date.now() / 1000), text: "stale" } };
