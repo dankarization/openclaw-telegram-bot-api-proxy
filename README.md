@@ -59,7 +59,9 @@ sequenceDiagram
 - FIFO хранит не больше `MAX_QUEUED_GETUPDATES_PER_BOT` ожидающих polls на bot
   ID. Слот резервируется до чтения request body, без захвата upstream lock;
   избыточный запрос быстро получает HTTP 429, поэтому одновременные buffered
-  bodies не накапливаются без границы.
+  bodies не накапливаются без границы. Незавершённый body получает HTTP 408
+  через `GETUPDATES_BODY_READ_TIMEOUT_MS`, соединение закрывается, слот
+  освобождается.
 - Имена Bot API методов нормализуются без учёта регистра до выбора policy:
   `GETUPDATES`, `GETFILE` и `SETWEBHOOK` не обходят cursor guard, file routing
   или local-only ограничения.
@@ -191,6 +193,7 @@ Entrypoint импортирует соседние модули из `src/`. П�
 | `LOCAL_GETUPDATES_TIMEOUT_SECONDS` | `10` | Максимальный `timeout` для local `getUpdates`; `0` отключает long poll. |
 | `LOCAL_GETUPDATES_MAX_ATTEMPTS` | `4` | Количество local-попыток `getUpdates` перед fallback/ошибкой. |
 | `MAX_QUEUED_GETUPDATES_PER_BOT` | `4` | Максимум ожидающих FIFO polls на один публичный bot ID; превышение возвращает 429. |
+| `GETUPDATES_BODY_READ_TIMEOUT_MS` | `5000` | Общий deadline чтения body `getUpdates`; превышение возвращает 408, закрывает соединение и освобождает admission slot. |
 | `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
 | `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |

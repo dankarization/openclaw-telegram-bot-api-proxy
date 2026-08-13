@@ -124,6 +124,7 @@ async function startHarness(t, localHandler, env = {}) {
       LOCAL_HEALTH_TIMEOUT_MS: "1000",
       LOCAL_HEALTH_TTL_MS: "1000",
       LOCAL_UNHEALTHY_COOLDOWN_MS: "1",
+      GETUPDATES_BODY_READ_TIMEOUT_MS: "5000",
       PORT: String(port),
       TELEGRAM_OFFSET_DIR: "/path/that/does/not/exist",
       UPSTREAM_TIMEOUT_MS: "2000",
@@ -277,6 +278,31 @@ test("excess same-bot polls fail before an incomplete body is buffered", async (
     harness.child,
     harness.output,
     "action=poll-queue-rejected status=429",
+  );
+});
+
+test("incomplete getUpdates bodies time out and release reserved admission", async (t) => {
+  let pollCalls = 0;
+  const harness = await startHarness(t, async (request) => {
+    if (request.method === "getMe") {
+      return json(200, { ok: true, result: { id: Number(request.botId) } });
+    }
+    if (request.method !== "getUpdates") return null;
+    pollCalls += 1;
+    return json(200, { ok: true, result: [] });
+  }, {
+    GETUPDATES_BODY_READ_TIMEOUT_MS: "50",
+    MAX_QUEUED_GETUPDATES_PER_BOT: "0",
+  });
+  const token = "116116:body-timeout-secret";
+
+  assert.equal(await incompletePostStatus(harness.proxyRoot, token), 408);
+  assert.equal((await poll(harness.proxyRoot, token)).status, 200);
+  assert.equal(pollCalls, 1);
+  await waitForOutput(
+    harness.child,
+    harness.output,
+    "action=body-read-timeout status=408 timeoutMs=50",
   );
 });
 

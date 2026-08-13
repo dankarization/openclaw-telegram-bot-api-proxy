@@ -14,7 +14,10 @@ Different bot IDs use independent lanes and may run concurrently.
 Each lane retains at most `MAX_QUEUED_GETUPDATES_PER_BOT` waiting polls (four by
 default). Further polls fail fast with HTTP 429 instead of retaining an
 unbounded number of buffered request bodies. Admission capacity is reserved
-before body buffering without starting or owning the upstream poll cycle.
+before body buffering without starting or owning the upstream poll cycle. The
+body must complete within `GETUPDATES_BODY_READ_TIMEOUT_MS` (five seconds by
+default); otherwise the proxy returns HTTP 408, closes the connection, and
+releases the reservation.
 
 The same topology is available as a standalone
 [SVG/HTML diagram](per-bot-poll-coordinator-diagram.html).
@@ -41,8 +44,9 @@ sequenceDiagram
 ```
 
 The bounded request body is read before lane acquisition. An incomplete body or
-a request carrying only a public bot ID plus a bogus secret therefore cannot
-starve the valid bot lane.
+a request carrying only a public bot ID plus a bogus secret can reserve
+admission only until the body deadline, so it cannot starve the valid bot lane
+indefinitely.
 
 The protected upstream decision cycle includes:
 
@@ -118,10 +122,11 @@ fingerprint suppression is introduced here.
 - a frozen raw POST/JSON routing trace from `c301f55` matches exactly;
 - same-bot concurrent polls reach upstream with maximum concurrency `1`;
 - excess same-bot polls receive HTTP 429 before an incomplete body is buffered;
+- an incomplete body receives HTTP 408 and releases its admission reservation;
 - the same scenario on `c301f55` demonstrates the former `409`;
 - two different bots reach upstream concurrently;
 - queued and active client disconnect paths behave as specified;
-- an incomplete POST body does not acquire or starve the bot lane;
+- an incomplete POST body cannot hold an admission slot beyond its deadline;
 - a failed/timeout owner releases the lane for the next waiter;
 - shutdown aborts active work and rejects queued/new work;
 - multipart upload remains local-only;

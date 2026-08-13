@@ -77,6 +77,11 @@ const maxQueuedGetUpdatesPerBot = parseNonNegativeInteger(
   process.env.MAX_QUEUED_GETUPDATES_PER_BOT,
   4,
 );
+// Полное тело getUpdates должно прийти быстро: просроченный клиент не удерживает admission slot.
+const getUpdatesBodyReadTimeoutMs = parsePositiveInteger(
+  process.env.GETUPDATES_BODY_READ_TIMEOUT_MS,
+  5000,
+);
 // Базовая пауза между retry local getUpdates. Пауза растет экспоненциально.
 const localGetUpdatesRetryBaseMs = parseNonNegativeInteger(process.env.LOCAL_GETUPDATES_RETRY_BASE_MS, 300);
 // Отдельный сетевой timeout для local getUpdates, чтобы оборванный long poll не висел по общему upstream timeout.
@@ -397,17 +402,37 @@ function streamingCounterFields() {
   return `activeStreaming=${streamingCounters.active} activeStreamingUploads=${streamingCounters.upload} activeStreamingDownloads=${streamingCounters.download} activeStreamingPassthrough=${streamingCounters.passthrough}`;
 }
 
-async function readRequestBody(req) {
-  const chunks = [];
-  let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    if (total > bufferLimitBytes) {
-      throw Object.assign(new Error("request body exceeds proxy buffer limit"), { code: "BODY_TOO_LARGE" });
+async function readRequestBody(req, options = {}) {
+  const readPromise = (async () => {
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of req) {
+      total += chunk.length;
+      if (total > bufferLimitBytes) {
+        throw Object.assign(new Error("request body exceeds proxy buffer limit"), { code: "BODY_TOO_LARGE" });
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+    return Buffer.concat(chunks);
+  })();
+
+  const timeoutMs = options.timeoutMs;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return readPromise;
+
+  let timeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error(`request body was not completed within ${timeoutMs}ms`);
+      error.code = "BODY_READ_TIMEOUT";
+      reject(error);
+    }, timeoutMs);
+    timeout.unref?.();
+  });
+  try {
+    return await Promise.race([readPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeout);
   }
-  return Buffer.concat(chunks);
 }
 
 function sleep(ms, signal) {
@@ -819,7 +844,9 @@ const server = http.createServer(async (req, res) => {
       const botKey = botIdFromToken(token) || "unknown";
       const reservation = pollCoordinator.reserve(botKey);
       try {
-        const body = await readRequestBody(req);
+        const body = await readRequestBody(req, {
+          timeoutMs: getUpdatesBodyReadTimeoutMs,
+        });
         await pollCoordinator.run(
           botKey,
           ({ signal }) => handleBuffered(
@@ -842,23 +869,35 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (error) {
     const queueFull = error?.code === "POLL_QUEUE_FULL";
+    const bodyReadTimeout = error?.code === "BODY_READ_TIMEOUT";
     if (queueFull) {
       req.resume();
       log(`method=getUpdates action=poll-queue-rejected status=429`);
+    } else if (bodyReadTimeout) {
+      log(`method=getUpdates action=body-read-timeout status=408 timeoutMs=${getUpdatesBodyReadTimeoutMs}`);
     } else {
       logError(`method=${method} ${errorLogFields(error)}`);
     }
     if (!res.headersSent && !res.destroyed && !res.writableEnded) {
-      const statusCode = queueFull ? 429 : 502;
+      const statusCode = queueFull ? 429 : bodyReadTimeout ? 408 : 502;
+      if (bodyReadTimeout) {
+        res.shouldKeepAlive = false;
+        res.once("finish", () => {
+          if (!req.destroyed) req.destroy();
+        });
+      }
       res.writeHead(statusCode, {
         "content-type": "application/json",
         ...(queueFull ? { "retry-after": "1" } : {}),
+        ...(bodyReadTimeout ? { connection: "close" } : {}),
       });
       res.end(JSON.stringify({
         ok: false,
         error_code: statusCode,
         description: queueFull
           ? "Too many concurrent getUpdates requests for this bot"
+          : bodyReadTimeout
+            ? "getUpdates request body timed out"
           : "Telegram Bot API proxy upstream failure",
       }));
     } else if (!res.destroyed && !res.writableEnded) {
@@ -872,7 +911,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} getUpdatesBodyReadTimeoutMs=${getUpdatesBodyReadTimeoutMs} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.
