@@ -129,3 +129,28 @@ test("buffered client forwards coordinator shutdown cancellation", async () => {
   controller.abort(new Error("shutdown"));
   await assert.rejects(pending, /shutdown/u);
 });
+
+test("buffered client labels its own timeout as ETIMEDOUT", async () => {
+  const client = createUpstreamClient({
+    upstreamTimeoutMs: 10,
+    fetchImpl: async (url, options) => new Promise((resolve, reject) => {
+      const guard = setTimeout(
+        () => reject(new Error(`abort was not delivered for ${url}`)),
+        1000,
+      );
+      options.signal.addEventListener("abort", () => {
+        clearTimeout(guard);
+        reject(options.signal.reason);
+      }, { once: true });
+    }),
+  });
+
+  await assert.rejects(
+    client.forwardBuffered(
+      request(),
+      "http://upstream.test",
+      Buffer.alloc(0),
+    ),
+    (error) => error?.code === "ETIMEDOUT" && error?.message === "upstream timeout",
+  );
+});

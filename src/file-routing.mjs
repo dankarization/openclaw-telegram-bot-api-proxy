@@ -1,10 +1,12 @@
 import {
   canonicalMethodName,
+  exactSafeNonNegativeInteger,
   filePathFromPathname,
   numericOffset,
 } from "./request-parsing.mjs";
 
 const DEFAULT_FILE_INFO_CACHE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_FILE_UPDATE_INFO_CACHE_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_CLOUD_FILE_FALLBACK_MAX_BYTES = 20 * 1024 * 1024;
 
 function trimPathPrefix(value) {
@@ -25,6 +27,8 @@ export class FileRouter {
   #cloudFileFallbackMaxBytes;
   #fileInfoByBotIdAndPath = new Map();
   #fileInfoCacheTtlMs;
+  #fileUpdateInfoByBotIdAndId = new Map();
+  #fileUpdateInfoCacheTtlMs;
   #localFilePathRewriteFrom;
   #localFilePathRewriteTo;
   #now;
@@ -32,12 +36,14 @@ export class FileRouter {
   constructor({
     cloudFileFallbackMaxBytes = DEFAULT_CLOUD_FILE_FALLBACK_MAX_BYTES,
     fileInfoCacheTtlMs = DEFAULT_FILE_INFO_CACHE_TTL_MS,
+    fileUpdateInfoCacheTtlMs = DEFAULT_FILE_UPDATE_INFO_CACHE_TTL_MS,
     localFilePathRewriteFrom = "",
     localFilePathRewriteTo = "",
     now = Date.now,
   } = {}) {
     this.#cloudFileFallbackMaxBytes = cloudFileFallbackMaxBytes;
     this.#fileInfoCacheTtlMs = fileInfoCacheTtlMs;
+    this.#fileUpdateInfoCacheTtlMs = fileUpdateInfoCacheTtlMs;
     this.#localFilePathRewriteFrom = trimPathPrefix(localFilePathRewriteFrom);
     this.#localFilePathRewriteTo = trimPathPrefix(localFilePathRewriteTo);
     this.#now = now;
@@ -111,6 +117,63 @@ export class FileRouter {
     return upstream;
   }
 
+  observeGetUpdatesResult(token, upstream, source) {
+    if (
+      upstream?.statusCode !== 200
+      || !upstream?.body?.length
+      || (source !== "local" && source !== "cloud")
+    ) {
+      return;
+    }
+    try {
+      const payload = JSON.parse(upstream.body.toString("utf8"));
+      if (!payload?.ok || !Array.isArray(payload.result)) return;
+      const files = this.#collectUpdateFileInfo(payload.result);
+      for (const [fileId, info] of files) {
+        this.#cacheUpdateFileInfo(token, fileId, info.fileSize, source);
+      }
+    } catch {
+      // Metadata capture is best-effort and never changes the update response.
+    }
+  }
+
+  cloudGetFileFallbackDecision(token, fileId) {
+    if (!fileId) return { allowed: false, reason: "file-id-unknown" };
+    const info = this.#cachedUpdateFileInfo(token, fileId);
+    if (info?.fileSize != null && info.fileSize > this.#cloudFileFallbackMaxBytes) {
+      return {
+        allowed: false,
+        reason: "file-too-large",
+        source: info.source,
+        fileSize: info.fileSize,
+      };
+    }
+    if (info?.source === "cloud") {
+      return {
+        allowed: true,
+        reason: "file-id-source-cloud",
+        source: "cloud",
+        fileSize: info.fileSize,
+      };
+    }
+    if (info?.fileSize != null) {
+      return {
+        allowed: true,
+        reason: "file-id-confirmed-small",
+        source: info.source,
+        fileSize: info.fileSize,
+      };
+    }
+    if (info?.source === "local") {
+      return {
+        allowed: false,
+        reason: "file-id-source-local-size-unknown",
+        source: "local",
+      };
+    }
+    return { allowed: false, reason: "file-id-source-unknown" };
+  }
+
   cloudFileFallbackDecision(token, pathname = "") {
     const botId = botIdFromToken(token);
     const filePath = filePathFromPathname(pathname);
@@ -169,10 +232,64 @@ export class FileRouter {
     return info;
   }
 
+  #cacheUpdateFileInfo(token, fileId, fileSize, source) {
+    const botId = botIdFromToken(token);
+    if (!botId || !fileId || (source !== "local" && source !== "cloud")) return;
+    const now = this.#now();
+    this.#pruneExpiredUpdateFileInfo(now);
+    const key = `${botId}:${fileId}`;
+    const previous = this.#fileUpdateInfoByBotIdAndId.get(key);
+    const parsedFileSize = exactSafeNonNegativeInteger(fileSize);
+    this.#fileUpdateInfoByBotIdAndId.set(key, {
+      fileSize: parsedFileSize ?? previous?.fileSize ?? null,
+      source,
+      cachedAt: now,
+    });
+  }
+
+  #cachedUpdateFileInfo(token, fileId) {
+    const key = `${botIdFromToken(token)}:${fileId}`;
+    const info = this.#fileUpdateInfoByBotIdAndId.get(key);
+    if (!info) return null;
+    if (this.#now() - info.cachedAt >= this.#fileUpdateInfoCacheTtlMs) {
+      this.#fileUpdateInfoByBotIdAndId.delete(key);
+      return null;
+    }
+    return info;
+  }
+
+  #collectUpdateFileInfo(value, files = new Map(), visited = new Set()) {
+    if (!value || typeof value !== "object" || visited.has(value)) return files;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) this.#collectUpdateFileInfo(item, files, visited);
+      return files;
+    }
+
+    const fileId = typeof value.file_id === "string" ? value.file_id : "";
+    if (fileId) {
+      const fileSize = exactSafeNonNegativeInteger(value.file_size);
+      const previous = files.get(fileId);
+      files.set(fileId, { fileSize: fileSize ?? previous?.fileSize ?? null });
+    }
+    for (const child of Object.values(value)) {
+      this.#collectUpdateFileInfo(child, files, visited);
+    }
+    return files;
+  }
+
   #pruneExpiredFileInfo(now) {
     for (const [key, info] of this.#fileInfoByBotIdAndPath) {
       if (now - info.cachedAt >= this.#fileInfoCacheTtlMs) {
         this.#fileInfoByBotIdAndPath.delete(key);
+      }
+    }
+  }
+
+  #pruneExpiredUpdateFileInfo(now) {
+    for (const [key, info] of this.#fileUpdateInfoByBotIdAndId) {
+      if (now - info.cachedAt >= this.#fileUpdateInfoCacheTtlMs) {
+        this.#fileUpdateInfoByBotIdAndId.delete(key);
       }
     }
   }

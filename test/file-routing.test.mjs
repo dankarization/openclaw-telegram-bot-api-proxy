@@ -28,6 +28,14 @@ function getFileResponse({
   };
 }
 
+function getUpdatesResponse(result) {
+  return {
+    statusCode: 200,
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({ ok: true, result })),
+  };
+}
+
 test("local getFile rewrites the path and keeps both local aliases local", () => {
   const router = createFileRouter({
     localFilePathRewriteFrom: "/container-data///",
@@ -250,5 +258,93 @@ test("missing file size preserves the legacy unknown-size decision", () => {
       `/file/bot${token}/${filePath}`,
     ),
     { allowed: false, reason: "file-size-unknown" },
+  );
+});
+
+test("getUpdates media metadata is recursive, bot-scoped, and size-gates getFile cloud fallback", () => {
+  const router = createFileRouter({
+    cloudFileFallbackMaxBytes: CLOUD_FILE_LIMIT,
+  });
+  const token = "777777:update-media-secret-value";
+  const otherToken = "888888:other-secret-value";
+  router.observeGetUpdatesResult(
+    token,
+    getUpdatesResponse([{
+      update_id: 1,
+      message: {
+        media_group_id: "album-1",
+        photo: [
+          { file_id: "thumb", file_size: 512 },
+          { file_id: "small", file_size: 4096 },
+        ],
+        reply_to_message: {
+          document: { file_id: "large", file_size: CLOUD_FILE_LIMIT + 1 },
+        },
+        voice: { file_id: "local-unknown" },
+      },
+    }]),
+    "local",
+  );
+
+  assert.deepEqual(router.cloudGetFileFallbackDecision(token, "small"), {
+    allowed: true,
+    reason: "file-id-confirmed-small",
+    source: "local",
+    fileSize: 4096,
+  });
+  assert.deepEqual(router.cloudGetFileFallbackDecision(token, "large"), {
+    allowed: false,
+    reason: "file-too-large",
+    source: "local",
+    fileSize: CLOUD_FILE_LIMIT + 1,
+  });
+  assert.deepEqual(router.cloudGetFileFallbackDecision(token, "local-unknown"), {
+    allowed: false,
+    reason: "file-id-source-local-size-unknown",
+    source: "local",
+  });
+  assert.deepEqual(
+    router.cloudGetFileFallbackDecision(otherToken, "small"),
+    { allowed: false, reason: "file-id-source-unknown" },
+  );
+
+  router.observeGetUpdatesResult(
+    token,
+    getUpdatesResponse([{
+      update_id: 2,
+      message: { document: { file_id: "cloud-unknown" } },
+    }]),
+    "cloud",
+  );
+  assert.deepEqual(router.cloudGetFileFallbackDecision(token, "cloud-unknown"), {
+    allowed: true,
+    reason: "file-id-source-cloud",
+    source: "cloud",
+    fileSize: null,
+  });
+});
+
+test("getUpdates media metadata expires at its independent TTL", () => {
+  let currentTime = 50_000;
+  const router = createFileRouter({
+    fileUpdateInfoCacheTtlMs: 1_000,
+    now: () => currentTime,
+  });
+  const token = "999999:update-ttl-secret-value";
+  router.observeGetUpdatesResult(
+    token,
+    getUpdatesResponse([{
+      update_id: 1,
+      message: { document: { file_id: "expiring", file_size: 100 } },
+    }]),
+    "local",
+  );
+
+  currentTime = 50_999;
+  assert.equal(router.cloudGetFileFallbackDecision(token, "expiring").allowed, true);
+  currentTime = 51_000;
+  assert.deepEqual(
+    router.cloudGetFileFallbackDecision(token, "expiring"),
+    { allowed: false, reason: "file-id-source-unknown" },
   );
 });

@@ -11,6 +11,7 @@ import {
   canBufferRequest,
   copyHeaders,
   numericOffset,
+  requestFileId,
   streamingKind,
   telegramRouteFromPath,
 } from "./request-parsing.mjs";
@@ -37,6 +38,11 @@ const telegramOffsetDir = process.env.TELEGRAM_OFFSET_DIR || "telegram";
 const cloudFileFallbackMaxBytes = Number.parseInt(process.env.CLOUD_FILE_FALLBACK_MAX_BYTES || String(20 * 1024 * 1024), 10);
 // TTL связи file_path с upstream, который вернул успешный getFile.
 const fileInfoCacheTtlMs = parsePositiveInteger(process.env.FILE_INFO_CACHE_TTL_MS, 5 * 60 * 1000);
+// TTL provenance/size metadata, собранной из getUpdates по botId + file_id.
+const fileUpdateInfoCacheTtlMs = parsePositiveInteger(
+  process.env.FILE_UPDATE_INFO_CACHE_TTL_MS,
+  30 * 60 * 1000,
+);
 // Контейнерный префикс absolute file_path, который Docker Bot API возвращает в --local.
 const localFilePathRewriteFrom = process.env.LOCAL_FILE_PATH_REWRITE_FROM || "";
 // Host-префикс того же volume, доступный OpenClaw для прямого чтения файла.
@@ -51,6 +57,13 @@ const localUnhealthyCooldownMs = Number.parseInt(process.env.LOCAL_UNHEALTHY_COO
 const localHealthTimeoutMs = Number.parseInt(process.env.LOCAL_HEALTH_TIMEOUT_MS || "2000", 10);
 // Общий таймаут запроса к upstream API.
 const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || "130000", 10);
+// Ограниченный local retry для getFile не зависит от короткого health-check.
+const localGetFileMaxAttempts = parsePositiveInteger(process.env.LOCAL_GETFILE_MAX_ATTEMPTS, 3);
+const localGetFileRetryBaseMs = parseNonNegativeInteger(process.env.LOCAL_GETFILE_RETRY_BASE_MS, 250);
+const localGetFileUpstreamTimeoutMs = parsePositiveInteger(
+  process.env.LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS,
+  15000,
+);
 // Разрешает аварийный cloud fallback именно для getUpdates после local retry.
 const cloudGetUpdatesFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_GETUPDATES_FALLBACK, true);
 // Разрешает rescue cloud backlog после успешного пустого local getUpdates; только явный opt-in.
@@ -108,8 +121,6 @@ const updateBridge = createLegacyUpdateBridge({
 const seededLocalUpdateStateCount = updateBridge.seededLocalUpdateStateCount;
 const cloudRequestForGetUpdates = updateBridge.cloudRequestForGetUpdates.bind(updateBridge);
 const localRequestForGetUpdates = updateBridge.localRequestForGetUpdates.bind(updateBridge);
-const guardedCloudGetUpdates = updateBridge.guardedCloudGetUpdates.bind(updateBridge);
-const guardedLocalGetUpdates = updateBridge.guardedLocalGetUpdates.bind(updateBridge);
 const emptySuccessfulGetUpdates = updateBridge.emptySuccessfulGetUpdates.bind(updateBridge);
 // Один bot получает ровно один полный getUpdates cycle; разные bot ID не блокируют друг друга.
 const pollCoordinator = new PerBotPollCoordinator({
@@ -131,6 +142,7 @@ const {
 const fileRouter = createFileRouter({
   cloudFileFallbackMaxBytes,
   fileInfoCacheTtlMs,
+  fileUpdateInfoCacheTtlMs,
   localFilePathRewriteFrom,
   localFilePathRewriteTo,
   now: runtimeHooks.now,
@@ -140,6 +152,23 @@ const fallbackPolicy = createFallbackPolicy({
   cloudGetUpdatesFallbackEnabled,
   fileRouter,
 });
+function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}) {
+  fileRouter.observeGetUpdatesResult(token, upstream, "cloud");
+  return updateBridge.guardedCloudGetUpdates(
+    req,
+    method,
+    token,
+    body,
+    upstream,
+    options,
+  );
+}
+
+function guardedLocalGetUpdates(req, method, token, body, upstream) {
+  fileRouter.observeGetUpdatesResult(token, upstream, "local");
+  return updateBridge.guardedLocalGetUpdates(req, method, token, body, upstream);
+}
+
 const processGetFileResult = fileRouter.processGetFileResult.bind(fileRouter);
 const cloudFallbackPolicy = fallbackPolicy.cloudFallbackPolicy.bind(fallbackPolicy);
 const canUseCloudFallback = fallbackPolicy.canUseCloudFallback.bind(fallbackPolicy);
@@ -368,7 +397,40 @@ function getUpdatesRetryDelayMs(attempt) {
   return localGetUpdatesRetryBaseMs * (2 ** Math.max(0, attempt - 1));
 }
 
+function getFileRetryDelayMs(attempt) {
+  return localGetFileRetryBaseMs * (2 ** Math.max(0, attempt - 1));
+}
+
 async function forwardLocalBuffered(req, method, token, body, options = {}) {
+  if (method === "getFile") {
+    for (let attempt = 1; attempt <= localGetFileMaxAttempts; attempt += 1) {
+      try {
+        const upstream = await forwardBuffered(req, localRoot, body, req.url, {
+          method,
+          signal: options.signal,
+          target: "local",
+          timeoutMs: localGetFileUpstreamTimeoutMs,
+        });
+        if (upstream.statusCode < 500) markLocalHealthy();
+        return {
+          upstream,
+          req,
+          body,
+          attempts: attempt,
+          timeoutCapped: false,
+          timeout: localGetFileUpstreamTimeoutMs,
+        };
+      } catch (error) {
+        if (!isClearlyLocalUnavailable(error) || attempt >= localGetFileMaxAttempts) {
+          throw error;
+        }
+        const waitMs = getFileRetryDelayMs(attempt);
+        log(`method=getFile target=local action=retry attempt=${attempt} ${errorLogFields(error)} waitMs=${waitMs}`);
+        await sleep(waitMs, options.signal);
+      }
+    }
+  }
+
   if (method !== "getUpdates") {
     return {
       upstream: await forwardBuffered(req, localRoot, body, req.url, {
@@ -448,14 +510,38 @@ function writeBufferedResponse(res, upstream) {
   res.end(upstream.body);
 }
 
+function writeGetFileFallbackBlocked(res, policy, localStatus) {
+  const reason = policy?.reason || "policy-blocked";
+  const description = `Telegram Bot API proxy: local getFile unavailable; cloud fallback blocked (${reason})`;
+  const body = Buffer.from(JSON.stringify({
+    ok: false,
+    error_code: 503,
+    description,
+  }));
+  res.writeHead(503, {
+    "content-type": "application/json",
+    "content-length": String(body.length),
+  });
+  res.end(body);
+  return `fallbackReason=${reason} localStatus=${localStatus ?? "network-error"}`;
+}
+
 async function handleBuffered(req, res, method, token, startedAt, options = {}) {
   const signal = options.signal;
   const body = options.body ?? await readRequestBody(req);
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
   const localIsHealthy = await checkLocalHealth(token, signal);
-  const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
+  const baseCloudFallback = cloudFallbackPolicy(method, token, pathname, req);
+  const cloudFallback = method === "getFile" && baseCloudFallback.allowed
+    ? fileRouter.cloudGetFileFallbackDecision(token, requestFileId(req, body))
+    : baseCloudFallback;
   const cloudFallbackAllowed = cloudFallback.allowed;
-  if (method !== "getUpdates" && !localIsHealthy && cloudFallbackAllowed) {
+  if (
+    method !== "getUpdates"
+    && method !== "getFile"
+    && !localIsHealthy
+    && cloudFallbackAllowed
+  ) {
     const cloudRequest = cloudRequestForGetUpdates(req, method, token, body);
     const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl, {
       method,
@@ -482,7 +568,28 @@ async function handleBuffered(req, res, method, token, startedAt, options = {}) 
       log(`method=getUpdates target=local action=dropped-local-update dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"} ackOffset=${localGuard.ackOffset ?? "none"}`);
       await acknowledgeDroppedLocalUpdates(localReq, token, localBody, localGuard.ackOffset, signal);
     }
-    if (cloudFallbackAllowed && shouldRetryCloudAfterLocalStatus(method, local.statusCode) && body.length <= bufferLimitBytes) {
+    const shouldRetryCloudForStatus = shouldRetryCloudAfterLocalStatus(
+      method,
+      local.statusCode,
+    );
+    if (
+      method === "getFile"
+      && !cloudFallbackAllowed
+      && (shouldRetryCloudForStatus || local.statusCode >= 500)
+    ) {
+      const blockedFields = writeGetFileFallbackBlocked(
+        res,
+        cloudFallback,
+        local.statusCode,
+      );
+      log(`method=getFile target=local action=fallback-blocked ${blockedFields} status=503 localAttempts=${localAttempt.attempts} ms=${Date.now() - startedAt}`);
+      return;
+    }
+    if (
+      cloudFallbackAllowed
+      && shouldRetryCloudForStatus
+      && body.length <= bufferLimitBytes
+    ) {
       const cloudRequest = cloudRequestForGetUpdates(localReq, method, token, localBody);
       const cloudRaw = await forwardBuffered(req, cloudRoot, cloudRequest.body, cloudRequest.reqUrl, {
         method,
@@ -589,6 +696,11 @@ async function handleBuffered(req, res, method, token, startedAt, options = {}) 
     }
     if (!cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
       markLocalUnhealthy(errorReason(error));
+      if (method === "getFile") {
+        const blockedFields = writeGetFileFallbackBlocked(res, cloudFallback, null);
+        log(`method=getFile target=local action=fallback-blocked ${blockedFields} ${errorLogFields(error)} status=503 localAttempts=${localGetFileMaxAttempts} ms=${Date.now() - startedAt}`);
+        return;
+      }
       log(`method=${method} target=local action=fallback-blocked fallbackReason=${cloudFallback.reason} ${errorLogFields(error)} ms=${Date.now() - startedAt}`);
     }
     throw error;
@@ -710,7 +822,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.

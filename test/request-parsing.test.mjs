@@ -17,6 +17,7 @@ import {
   numericOffset,
   requestOffsetFloor,
   requestOffsetValue,
+  requestFileId,
   requestTimeoutValue,
   requestWithUrl,
   streamingKind,
@@ -141,6 +142,45 @@ test("offset and timeout extraction prefers query then supports JSON and form bo
 
   assert.equal(requestOffsetValue(jsonReq, Buffer.from("{bad-json")), null);
   assert.equal(requestTimeoutValue(request("/bot1:x/getUpdates"), Buffer.alloc(0)), null);
+});
+
+test("getFile file_id extraction prefers query then supports JSON and form bodies", () => {
+  assert.equal(
+    requestFileId(
+      request("/bot1:x/getFile?file_id=query-id", {
+        headers: { "content-type": "application/json" },
+      }),
+      jsonBody({ file_id: "body-id" }),
+    ),
+    "query-id",
+  );
+  assert.equal(
+    requestFileId(
+      request("/bot1:x/getFile", {
+        headers: { "content-type": "application/json" },
+      }),
+      jsonBody({ file_id: "json-id" }),
+    ),
+    "json-id",
+  );
+  assert.equal(
+    requestFileId(
+      request("/bot1:x/getFile", {
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      Buffer.from("file_id=form-id"),
+    ),
+    "form-id",
+  );
+  assert.equal(
+    requestFileId(
+      request("/bot1:x/getFile", {
+        headers: { "content-type": "application/json" },
+      }),
+      Buffer.from("{bad-json"),
+    ),
+    "",
+  );
 });
 
 test("offset and timeout rewrites preserve JSON, form, and query behavior", () => {

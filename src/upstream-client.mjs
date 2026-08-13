@@ -54,7 +54,9 @@ export function createUpstreamClient(options = {}) {
     const url = `${root}${reqUrl}`;
     const controller = new AbortController();
     const timeoutMs = requestOptions.timeoutMs ?? upstreamTimeoutMs;
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => {
+      controller.abort(Object.assign(new Error("upstream timeout"), { code: "ETIMEDOUT" }));
+    }, timeoutMs);
     timeout.unref?.();
     try {
       const signal = requestOptions.signal

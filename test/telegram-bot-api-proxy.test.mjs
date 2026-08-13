@@ -166,6 +166,9 @@ async function startHarness(t, options) {
       LOCAL_UNHEALTHY_COOLDOWN_MS: "1",
       LOCAL_HEALTH_TIMEOUT_MS: "1000",
       UPSTREAM_TIMEOUT_MS: "2000",
+      LOCAL_GETFILE_MAX_ATTEMPTS: "3",
+      LOCAL_GETFILE_RETRY_BASE_MS: "1",
+      LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS: "250",
       LOCAL_GETUPDATES_TIMEOUT_SECONDS: "10",
       LOCAL_GETUPDATES_MAX_ATTEMPTS: "4",
       LOCAL_GETUPDATES_RETRY_BASE_MS: "300",
@@ -176,6 +179,7 @@ async function startHarness(t, options) {
       LOCAL_VIRTUAL_OFFSET_SKEW_MIN: "1000000",
       LOCAL_UPDATE_STATE_SEED: "",
       FILE_INFO_CACHE_TTL_MS: "300000",
+      FILE_UPDATE_INFO_CACHE_TTL_MS: "1800000",
       LOCAL_FILE_PATH_REWRITE_FROM: "/container-data",
       LOCAL_FILE_PATH_REWRITE_TO: "/host-data",
       ...options.env,
@@ -207,11 +211,15 @@ async function startHarness(t, options) {
 }
 
 async function getFile(proxyRoot, token, fileId) {
-  const response = await fetch(`${proxyRoot}/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`);
-  const payload = await response.json();
-  assert.equal(response.status, 200, JSON.stringify(payload));
+  const { status, payload } = await rawGetFile(proxyRoot, token, fileId);
+  assert.equal(status, 200, JSON.stringify(payload));
   assert.equal(payload.ok, true, JSON.stringify(payload));
   return payload.result;
+}
+
+async function rawGetFile(proxyRoot, token, fileId) {
+  const response = await fetch(`${proxyRoot}/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  return { status: response.status, payload: await response.json() };
 }
 
 function encodeFilePath(filePath) {
@@ -245,6 +253,252 @@ function healthyGetMe(request, healthy = true) {
   return null;
 }
 
+test("getFile still tries local when the 2-second health check aborts", async (t) => {
+  const token = "710101:health-timeout-secret-1234567890";
+  const harness = await startHarness(t, {
+    env: {
+      LOCAL_HEALTH_TIMEOUT_MS: "20",
+      LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS: "250",
+    },
+    local: (request) => {
+      if (request.kind === "api" && request.method === "getMe") {
+        return delayed(80, json(200, { ok: true, result: { id: 710101 } }));
+      }
+      if (request.kind === "api" && request.method === "getFile") {
+        return json(200, {
+          ok: true,
+          result: {
+            file_path: "/container-data/health/photo.jpg",
+            file_size: 1024,
+          },
+        });
+      }
+      return null;
+    },
+    cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
+  });
+
+  const file = await getFile(harness.proxyRoot, token, "health-local-file");
+  assert.equal(file.file_path, "/host-data/health/photo.jpg");
+  assert.equal(
+    harness.local.requests.filter((request) => request.method === "getFile").length,
+    1,
+  );
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    0,
+  );
+  await waitForOutput(harness.output, "local=down reason=20");
+});
+
+test("getFile retries local ETIMEDOUT and succeeds without cloud", async (t) => {
+  const token = "710102:getfile-retry-secret-1234567890";
+  let attempts = 0;
+  const harness = await startHarness(t, {
+    env: {
+      LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS: "20",
+      LOCAL_GETFILE_RETRY_BASE_MS: "1",
+    },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getFile") {
+        attempts += 1;
+        if (attempts === 1) {
+          return delayed(80, json(200, {
+            ok: true,
+            result: { file_path: "/container-data/late.jpg" },
+          }));
+        }
+        return json(200, {
+          ok: true,
+          result: {
+            file_path: "/container-data/retried.jpg",
+            file_size: 2048,
+          },
+        });
+      }
+      return null;
+    },
+    cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
+  });
+
+  const file = await getFile(harness.proxyRoot, token, "retry-local-file");
+  assert.equal(file.file_path, "/host-data/retried.jpg");
+  assert.equal(attempts, 2);
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    0,
+  );
+  assert.match(
+    harness.output.value,
+    /method=getFile target=local action=retry attempt=1 reason=ETIMEDOUT/u,
+  );
+});
+
+test("confirmed-small media-group file may use cloud after local retries are exhausted", async (t) => {
+  const token = "710103:small-media-group-secret-1234567890";
+  const fileId = "small-photo-large";
+  const harness = await startHarness(t, {
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        const now = Math.floor(Date.now() / 1000);
+        return json(200, {
+          ok: true,
+          result: [
+            {
+              update_id: 10,
+              message: {
+                date: now,
+                media_group_id: "album-1",
+                photo: [
+                  { file_id: "small-photo-thumb", file_size: 512 },
+                  { file_id: fileId, file_size: 4096 },
+                ],
+              },
+            },
+            {
+              update_id: 11,
+              message: {
+                date: now,
+                media_group_id: "album-1",
+                video: { file_id: "small-video", file_size: 8192 },
+              },
+            },
+          ],
+        });
+      }
+      if (request.kind === "api" && request.method === "getFile") return disconnect();
+      return null;
+    },
+    cloud: (request) => {
+      if (request.kind === "api" && request.method === "getFile") {
+        return json(200, {
+          ok: true,
+          result: { file_path: "photos/small.jpg", file_size: 4096 },
+        });
+      }
+      if (request.kind === "file") return text(200, "small-cloud-download");
+      return healthyGetMe(request);
+    },
+  });
+
+  await getUpdates(harness.proxyRoot, token, 0);
+  const file = await getFile(harness.proxyRoot, token, fileId);
+  assert.equal(file.file_path, "photos/small.jpg");
+  assert.equal(
+    harness.local.requests.filter((request) => request.method === "getFile").length,
+    3,
+  );
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    1,
+  );
+});
+
+test("cloud-sourced file_id keeps cloud affinity after mandatory local getFile", async (t) => {
+  const token = "710104:cloud-source-secret-1234567890";
+  const fileId = "cloud-source-no-size";
+  const cloudPath = "documents/cloud-source.bin";
+  const harness = await startHarness(t, {
+    env: {
+      ENABLE_CLOUD_GETUPDATES_FALLBACK: "1",
+      ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY: "1",
+      CLOUD_PENDING_FALLBACK_DELAY_MS: "0",
+    },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, { ok: true, result: [] });
+      }
+      if (request.kind === "api" && request.method === "getFile") {
+        return json(400, { ok: false, description: "Bad Request: file not found" });
+      }
+      if (request.kind === "file") return text(404, "wrong-local");
+      return null;
+    },
+    cloud: (request) => {
+      if (request.kind === "api" && request.method === "getWebhookInfo") {
+        return json(200, { ok: true, result: { pending_update_count: 1 } });
+      }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 5,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: fileId },
+            },
+          }],
+        });
+      }
+      if (request.kind === "api" && request.method === "getFile") {
+        return json(200, {
+          ok: true,
+          result: { file_path: cloudPath, file_size: 4096 },
+        });
+      }
+      if (request.kind === "file") return text(200, `cloud:${request.filePath}`);
+      return healthyGetMe(request);
+    },
+  });
+
+  assert.deepEqual(
+    (await getUpdates(harness.proxyRoot, token, 1000)).map((update) => update.update_id),
+    [1000],
+  );
+  const file = await getFile(harness.proxyRoot, token, fileId);
+  assert.equal(file.file_path, cloudPath);
+  assert.equal(
+    harness.local.requests.filter((request) => request.method === "getFile").length,
+    1,
+  );
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    1,
+  );
+  assert.deepEqual(await downloadFile(harness.proxyRoot, token, cloudPath), {
+    status: 200,
+    body: `cloud:${cloudPath}`,
+  });
+});
+
+test("media metadata capture leaves seeded getUpdates offset virtualization unchanged", async (t) => {
+  const token = "710106:offset-virtualization-secret-1234567890";
+  const localOffsets = [];
+  const harness = await startHarness(t, {
+    env: { LOCAL_UPDATE_STATE_SEED: "710106:41:9000" },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        localOffsets.push(request.offset);
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 42,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              audio: { file_id: "offset-audio", file_size: 2048 },
+            },
+          }],
+        });
+      }
+      return null;
+    },
+    cloud: (request) => healthyGetMe(request),
+  });
+
+  const updates = await getUpdates(harness.proxyRoot, token, 9001);
+  assert.deepEqual(localOffsets, ["42"]);
+  assert.deepEqual(updates.map((update) => update.update_id), [9001]);
+  assert.equal(updates[0].message.audio.file_id, "offset-audio");
+});
+
 test("local getFile keeps a rewritten local download on local", async (t) => {
   const token = "111111:local-secret-value-1234567890";
   let localHealthy = true;
@@ -274,7 +528,7 @@ test("local getFile keeps a rewritten local download on local", async (t) => {
   assert.equal(harness.cloud.requests.filter((request) => request.kind === "file").length, 0);
 });
 
-test("local 400 followed by cloud getFile keeps the download on cloud", async (t) => {
+test("confirmed-small local update may fall back from local 400 and keeps the download on cloud", async (t) => {
   const token = "222222:cloud-secret-value-1234567890";
   const cloudPath = "documents/from-cloud.pdf";
   const harness = await startHarness(t, {
@@ -283,6 +537,18 @@ test("local 400 followed by cloud getFile keeps the download on cloud", async (t
       if (health) return health;
       if (request.kind === "api" && request.method === "getFile") {
         return json(400, { ok: false, description: "Bad Request: file not found" });
+      }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 1,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: "cloud-file", file_size: 4096 },
+            },
+          }],
+        });
       }
       if (request.kind === "file") return text(404, "wrong-local");
       return null;
@@ -296,6 +562,7 @@ test("local 400 followed by cloud getFile keeps the download on cloud", async (t
     },
   });
 
+  await getUpdates(harness.proxyRoot, token, 0);
   const file = await getFile(harness.proxyRoot, token, "cloud-file");
   assert.equal(file.file_path, cloudPath);
   const download = await downloadFile(harness.proxyRoot, token, file.file_path);
@@ -303,11 +570,11 @@ test("local 400 followed by cloud getFile keeps the download on cloud", async (t
   assert.equal(harness.local.requests.filter((request) => request.kind === "file").length, 0);
 });
 
-test("the 20 MB cloud ceiling overrides affinity while large local files stay local", async (t) => {
+test("a 147 MB update never reaches cloud getFile while boundary and local-large routing stay safe", async (t) => {
   const token = "333333:limit-secret-value-1234567890";
   const fileById = {
     boundary: { source: "cloud", file_path: "cloud/boundary.bin", file_size: CLOUD_FILE_LIMIT },
-    over: { source: "cloud", file_path: "cloud/over.bin", file_size: CLOUD_FILE_LIMIT + 1 },
+    over: { source: "cloud", file_path: "cloud/over.bin", file_size: 147 * 1024 * 1024 },
     localLarge: { source: "local", file_path: "/container-data/local/large.bin", file_size: CLOUD_FILE_LIMIT + 1 },
   };
   const harness = await startHarness(t, {
@@ -318,6 +585,18 @@ test("the 20 MB cloud ceiling overrides affinity while large local files stay lo
         const file = fileById[request.fileId];
         if (file?.source === "local") return json(200, { ok: true, result: file });
         return json(400, { ok: false, description: "Bad Request: file not found" });
+      }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: Object.entries(fileById).map(([fileId, file], index) => ({
+            update_id: index + 1,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: fileId, file_size: file.file_size },
+            },
+          })),
+        });
       }
       if (request.kind === "file") return text(200, `local:${request.filePath}`);
       return null;
@@ -331,17 +610,17 @@ test("the 20 MB cloud ceiling overrides affinity while large local files stay lo
     },
   });
 
+  await getUpdates(harness.proxyRoot, token, 0);
+
   const boundary = await getFile(harness.proxyRoot, token, "boundary");
   assert.deepEqual(await downloadFile(harness.proxyRoot, token, boundary.file_path), {
     status: 200,
     body: "cloud:cloud/boundary.bin",
   });
 
-  const over = await getFile(harness.proxyRoot, token, "over");
-  assert.deepEqual(await downloadFile(harness.proxyRoot, token, over.file_path), {
-    status: 200,
-    body: "local:cloud/over.bin",
-  });
+  const over = await rawGetFile(harness.proxyRoot, token, "over");
+  assert.equal(over.status, 503);
+  assert.match(over.payload.description, /cloud fallback blocked \(file-too-large\)/u);
 
   const localLarge = await getFile(harness.proxyRoot, token, "localLarge");
   assert.equal(localLarge.file_path, "/host-data/local/large.bin");
@@ -352,6 +631,12 @@ test("the 20 MB cloud ceiling overrides affinity while large local files stay lo
 
   const cloudDownloads = harness.cloud.requests.filter((request) => request.kind === "file");
   assert.deepEqual(cloudDownloads.map((request) => request.filePath), ["cloud/boundary.bin"]);
+  assert.deepEqual(
+    harness.cloud.requests
+      .filter((request) => request.method === "getFile")
+      .map((request) => request.fileId),
+    ["boundary"],
+  );
 });
 
 test("expired file metadata no longer controls download routing", async (t) => {
@@ -365,6 +650,18 @@ test("expired file metadata no longer controls download routing", async (t) => {
       if (request.kind === "api" && request.method === "getFile") {
         return json(400, { ok: false, description: "Bad Request: file not found" });
       }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 1,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: "expires", file_size: 100 },
+            },
+          }],
+        });
+      }
       if (request.kind === "file") return text(200, "local-after-expiry");
       return null;
     },
@@ -377,6 +674,7 @@ test("expired file metadata no longer controls download routing", async (t) => {
     },
   });
 
+  await getUpdates(harness.proxyRoot, token, 0);
   const file = await getFile(harness.proxyRoot, token, "expires");
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.deepEqual(await downloadFile(harness.proxyRoot, token, file.file_path), {
@@ -400,6 +698,19 @@ test("bot-scoped affinity remains isolated under parallel requests without leaki
         }
         return json(400, { ok: false, description: "Bad Request: file not found" });
       }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        const fileId = request.token === localToken ? "local-shared" : "cloud-shared";
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: request.token === localToken ? 1 : 2,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: fileId, file_size: 200 },
+            },
+          }],
+        });
+      }
       if (request.kind === "file") return text(200, `local:${request.token}`);
       return null;
     },
@@ -412,6 +723,10 @@ test("bot-scoped affinity remains isolated under parallel requests without leaki
     },
   });
 
+  await Promise.all([
+    getUpdates(harness.proxyRoot, localToken, 0),
+    getUpdates(harness.proxyRoot, cloudToken, 0),
+  ]);
   const [localFile, cloudFile] = await Promise.all([
     getFile(harness.proxyRoot, localToken, "local-shared"),
     getFile(harness.proxyRoot, cloudToken, "cloud-shared"),

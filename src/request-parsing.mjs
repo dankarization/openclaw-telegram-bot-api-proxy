@@ -148,6 +148,27 @@ export function requestOffsetFloor(req, body) {
   return offset == null ? null : offset - 1;
 }
 
+export function requestFileId(req, body) {
+  const url = new URL(req.url || "/", "http://proxy.local");
+  const queryFileId = url.searchParams.get("file_id");
+  if (queryFileId) return queryFileId;
+
+  if (!body?.length) return "";
+  const type = contentType(req);
+  try {
+    if (type.includes("application/json")) {
+      const payload = JSON.parse(body.toString("utf8"));
+      return typeof payload?.file_id === "string" ? payload.file_id : "";
+    }
+    if (type.includes("x-www-form-urlencoded")) {
+      return new URLSearchParams(body.toString("utf8")).get("file_id") || "";
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
 export function bodyWithOffset(req, body, offset) {
   const type = String(req.headers["content-type"] || "").toLowerCase();
   if (body?.length && type.includes("application/json")) {
