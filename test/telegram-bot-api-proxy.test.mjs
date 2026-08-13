@@ -336,6 +336,38 @@ test("getFile retries local ETIMEDOUT and succeeds without cloud", async (t) => 
   );
 });
 
+test("blocked getFile fallback preserves local authentication responses", async (t) => {
+  const token = "710107:auth-response-secret-1234567890";
+  let localStatus = 401;
+  const harness = await startHarness(t, {
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getFile") {
+        return json(localStatus, {
+          ok: false,
+          error_code: localStatus,
+          description: `local-${localStatus}`,
+        });
+      }
+      return null;
+    },
+    cloud: (request) => healthyGetMe(request),
+  });
+
+  const unauthorized = await rawGetFile(harness.proxyRoot, token, "unknown-file");
+  assert.equal(unauthorized.status, 401);
+  assert.equal(unauthorized.payload.description, "local-401");
+  localStatus = 404;
+  const missing = await rawGetFile(harness.proxyRoot, token, "unknown-file");
+  assert.equal(missing.status, 404);
+  assert.equal(missing.payload.description, "local-404");
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    0,
+  );
+});
+
 test("confirmed-small media-group file may use cloud after local retries are exhausted", async (t) => {
   const token = "710103:small-media-group-secret-1234567890";
   const fileId = "small-photo-large";

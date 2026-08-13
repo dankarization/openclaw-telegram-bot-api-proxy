@@ -596,7 +596,14 @@ async function handleBuffered(req, res, method, token, startedAt, options = {}) 
     if (
       method === "getFile"
       && !cloudFallbackAllowed
-      && (shouldRetryCloudForStatus || local.statusCode >= 500)
+      && (
+        local.statusCode >= 500
+        || (
+          shouldRetryCloudForStatus
+          && local.statusCode !== 401
+          && local.statusCode !== 404
+        )
+      )
     ) {
       const blockedFields = writeGetFileFallbackBlocked(
         res,
@@ -807,21 +814,27 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === "getUpdates") {
       // Buffer before lane acquisition: an incomplete or unauthenticated body
-      // must not starve every valid poll for the public bot ID.
-      const body = await readRequestBody(req);
+      // must not own upstream. Reserve bounded memory admission first so many
+      // incomplete bodies cannot all reach BUFFER_LIMIT_BYTES concurrently.
       const botKey = botIdFromToken(token) || "unknown";
-      await pollCoordinator.run(
-        botKey,
-        ({ signal }) => handleBuffered(
-          req,
-          res,
-          method,
-          token,
-          startedAt,
-          { body, signal },
-        ),
-        { signal: clientController.signal },
-      );
+      const reservation = pollCoordinator.reserve(botKey);
+      try {
+        const body = await readRequestBody(req);
+        await pollCoordinator.run(
+          botKey,
+          ({ signal }) => handleBuffered(
+            req,
+            res,
+            method,
+            token,
+            startedAt,
+            { body, signal },
+          ),
+          { reservation, signal: clientController.signal },
+        );
+      } finally {
+        reservation.release();
+      }
     } else if (canBufferRequest(req, bufferLimitBytes)) {
       await handleBuffered(req, res, method, token, startedAt);
     } else {
@@ -830,6 +843,7 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     const queueFull = error?.code === "POLL_QUEUE_FULL";
     if (queueFull) {
+      req.resume();
       log(`method=getUpdates action=poll-queue-rejected status=429`);
     } else {
       logError(`method=${method} ${errorLogFields(error)}`);

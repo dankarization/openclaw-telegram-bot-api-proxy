@@ -57,8 +57,9 @@ sequenceDiagram
   и fallback остаются под одним FIFO lock. Разные боты продолжают polling
   параллельно.
 - FIFO хранит не больше `MAX_QUEUED_GETUPDATES_PER_BOT` ожидающих polls на bot
-  ID. Избыточный запрос быстро получает HTTP 429, поэтому buffered bodies не
-  накапливаются в очереди без границы.
+  ID. Слот резервируется до чтения request body, без захвата upstream lock;
+  избыточный запрос быстро получает HTTP 429, поэтому одновременные buffered
+  bodies не накапливаются без границы.
 - Имена Bot API методов нормализуются без учёта регистра до выбора policy:
   `GETUPDATES`, `GETFILE` и `SETWEBHOOK` не обходят cursor guard, file routing
   или local-only ограничения.
@@ -97,6 +98,8 @@ sequenceDiagram
   `file_id` либо файла с известным размером не больше
   `CLOUD_FILE_FALLBACK_MAX_BYTES`. Для local-sourced файла неизвестного размера,
   неизвестного `file_id` и файла выше лимита fallback быстро завершается 503.
+- Local `getFile` 401/404 сохраняются как ошибки аутентификации/маршрута, когда
+  cloud fallback фактически запрещён; они не маскируются retryable 503.
 - Успешный `getFile` на время `FILE_INFO_CACHE_TTL_MS` связывает `file_path`
   с его upstream: local path скачивается через local, cloud path через cloud.
 - Cloud `/file/...` разрешён только если размер известен из `getFile` и не

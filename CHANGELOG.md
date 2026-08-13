@@ -11,7 +11,8 @@
   preserving cross-bot concurrency. Queued client cancellations are removed;
   an already-started ambiguous upstream cycle keeps its lane until completion.
 - Bound each bot's retained polling queue and return HTTP 429 at the configured
-  limit instead of retaining unbounded buffered request bodies.
+  limit before body buffering instead of retaining unbounded concurrent request
+  bodies.
 - Canonicalize Telegram's case-insensitive method names before routing, so
   variants such as `GETUPDATES`, `GETFILE`, and `SETWEBHOOK` cannot bypass
   cursor guards, coordination, or local-only policy.
@@ -34,6 +35,9 @@
   multipart local-only behavior.
 - Permit restore of non-destructive offset-zero poll intents without source
   incarnation evidence, consistent with the durable schema.
+- Fsync the completed SQLite backup and its parent directory before reporting a
+  published backup, and preserve local `getFile` 401/404 responses when policy
+  blocks cloud fallback.
 - Fallback `getFile` to cloud when local Bot API returns `400`, covering cloud
   fallback updates whose `file_id` is not known by the local API yet.
 - Bridge/virtualize local `update_id` values after cloud `getUpdates` fallback

@@ -34,6 +34,7 @@ export class PerBotPollCoordinator {
   #maxPendingPerBot;
   #now;
   #onEvent;
+  #reservationState = new WeakMap();
 
   constructor(options = {}) {
     const maxPendingPerBot = options.maxPendingPerBot ?? 4;
@@ -57,6 +58,43 @@ export class PerBotPollCoordinator {
     }));
   }
 
+  reserve(botKey) {
+    if (typeof botKey !== "string" || botKey.length === 0) {
+      throw new TypeError("botKey must be a non-empty string");
+    }
+    if (this.#closed) throw closedError(this.#closeReason);
+
+    let lane = this.#lanes.get(botKey);
+    if (!lane) {
+      lane = { active: null, queue: [], reservations: new Set() };
+      this.#lanes.set(botKey, lane);
+    }
+    const maxAdmitted = this.#maxPendingPerBot + 1;
+    if (lane.reservations.size >= maxAdmitted) {
+      this.#emit({
+        type: "queue-full",
+        botKey,
+        pending: lane.queue.length,
+        admitted: lane.reservations.size,
+        maxPending: this.#maxPendingPerBot,
+        maxAdmitted,
+      });
+      throw queueFullError(this.#maxPendingPerBot);
+    }
+
+    let reservation;
+    reservation = Object.freeze({
+      release: () => this.#releaseReservation(reservation),
+    });
+    lane.reservations.add(reservation);
+    this.#reservationState.set(reservation, {
+      botKey,
+      lane,
+      released: false,
+    });
+    return reservation;
+  }
+
   run(botKey, task, options = {}) {
     if (typeof botKey !== "string" || botKey.length === 0) {
       return Promise.reject(new TypeError("botKey must be a non-empty string"));
@@ -64,31 +102,31 @@ export class PerBotPollCoordinator {
     if (typeof task !== "function") {
       return Promise.reject(new TypeError("task must be a function"));
     }
-    if (this.#closed) return Promise.reject(closedError(this.#closeReason));
+    let reservation = options.reservation;
+    try {
+      if (this.#closed) throw closedError(this.#closeReason);
+      reservation ||= this.reserve(botKey);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    const reservationState = this.#reservationState.get(reservation);
+    if (
+      !reservationState
+      || reservationState.released
+      || reservationState.botKey !== botKey
+    ) {
+      reservation?.release?.();
+      return Promise.reject(new TypeError("invalid getUpdates admission reservation"));
+    }
 
     const signal = options.signal;
     if (signal?.aborted) {
+      reservation.release();
       return Promise.reject(abortError(signal.reason, "getUpdates request aborted before queueing"));
     }
 
-    let lane = this.#lanes.get(botKey);
-    if (
-      lane
-      && (lane.active != null || lane.queue.length > 0)
-      && lane.queue.length >= this.#maxPendingPerBot
-    ) {
-      this.#emit({
-        type: "queue-full",
-        botKey,
-        pending: lane.queue.length,
-        maxPending: this.#maxPendingPerBot,
-      });
-      return Promise.reject(queueFullError(this.#maxPendingPerBot));
-    }
-    if (!lane) {
-      lane = { active: null, queue: [] };
-      this.#lanes.set(botKey, lane);
-    }
+    const lane = reservationState.lane;
 
     return new Promise((resolve, reject) => {
       const item = {
@@ -96,6 +134,7 @@ export class PerBotPollCoordinator {
         enqueuedAt: this.#now(),
         onAbort: null,
         reject,
+        reservation,
         resolve,
         settled: false,
         signal,
@@ -117,6 +156,7 @@ export class PerBotPollCoordinator {
         if (index >= 0) lane.queue.splice(index, 1);
         item.settled = true;
         signal.removeEventListener("abort", item.onAbort);
+        item.reservation.release();
         reject(abortError(signal.reason, "getUpdates request aborted while queued"));
         this.#emit({
           type: "cancelled",
@@ -147,7 +187,11 @@ export class PerBotPollCoordinator {
         if (item.settled) continue;
         item.settled = true;
         item.signal?.removeEventListener("abort", item.onAbort);
+        item.reservation.release();
         item.reject(closedError(reason));
+      }
+      for (const reservation of [...lane.reservations]) {
+        reservation.release();
       }
       this.#emit({
         type: "closed",
@@ -200,6 +244,7 @@ export class PerBotPollCoordinator {
       });
     } finally {
       item.signal?.removeEventListener("abort", item.onAbort);
+      item.reservation.release();
       lane.active = null;
       this.#deleteIdleLane(botKey, lane);
       if (!this.#closed) void this.#drain(botKey, lane);
@@ -207,9 +252,22 @@ export class PerBotPollCoordinator {
   }
 
   #deleteIdleLane(botKey, lane) {
-    if (!lane.active && lane.queue.length === 0 && this.#lanes.get(botKey) === lane) {
+    if (
+      !lane.active
+      && lane.queue.length === 0
+      && lane.reservations.size === 0
+      && this.#lanes.get(botKey) === lane
+    ) {
       this.#lanes.delete(botKey);
     }
+  }
+
+  #releaseReservation(reservation) {
+    const state = this.#reservationState.get(reservation);
+    if (!state || state.released) return;
+    state.released = true;
+    state.lane.reservations.delete(reservation);
+    this.#deleteIdleLane(state.botKey, state.lane);
   }
 
   #emit(event) {

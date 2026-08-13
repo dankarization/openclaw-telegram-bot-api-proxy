@@ -161,6 +161,43 @@ async function poll(proxyRoot, token, options = {}) {
   return { payload: await response.json(), status: response.status };
 }
 
+async function incompletePostStatus(proxyRoot, token) {
+  const proxyUrl = new URL(proxyRoot);
+  const socket = net.createConnection({
+    host: proxyUrl.hostname,
+    port: Number(proxyUrl.port),
+  });
+  socket.on("error", () => {});
+  await once(socket, "connect");
+  try {
+    return await new Promise((resolve, reject) => {
+      let response = "";
+      const timeout = setTimeout(
+        () => reject(new Error(`proxy did not reject incomplete body:\n${response}`)),
+        1000,
+      );
+      socket.on("data", (chunk) => {
+        response += chunk.toString("utf8");
+        const match = response.match(/^HTTP\/1\.1 (\d{3}) /u);
+        if (!match) return;
+        clearTimeout(timeout);
+        resolve(Number(match[1]));
+      });
+      socket.write([
+        `POST /bot${token}/getUpdates HTTP/1.1`,
+        `Host: ${proxyUrl.host}`,
+        "Content-Type: application/json",
+        `Content-Length: ${8 * 1024 * 1024}`,
+        "Connection: close",
+        "",
+        '{"offset":',
+      ].join("\r\n"));
+    });
+  } finally {
+    socket.destroy();
+  }
+}
+
 test("same-bot long polls are serialized before the upstream can return 409", async (t) => {
   let active = 0;
   let maxActive = 0;
@@ -202,7 +239,7 @@ test("same-bot long polls are serialized before the upstream can return 409", as
   ]);
 });
 
-test("excess same-bot polls fail fast when the bounded queue is full", async (t) => {
+test("excess same-bot polls fail before an incomplete body is buffered", async (t) => {
   const activeStarted = deferred();
   const releaseActive = deferred();
   let pollCalls = 0;
@@ -226,11 +263,9 @@ test("excess same-bot polls fail fast when the bounded queue is full", async (t)
   await activeStarted.promise;
   const queued = poll(harness.proxyRoot, token);
   await new Promise((resolve) => setImmediate(resolve));
-  const excess = await poll(harness.proxyRoot, token);
+  const excessStatus = await incompletePostStatus(harness.proxyRoot, token);
 
-  assert.equal(excess.status, 429);
-  assert.equal(excess.payload.error_code, 429);
-  assert.match(excess.payload.description, /Too many concurrent getUpdates/u);
+  assert.equal(excessStatus, 429);
   assert.equal(pollCalls, 1);
   releaseActive.resolve();
   assert.deepEqual(

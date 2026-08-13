@@ -4,6 +4,7 @@ import {
   closeSync,
   fchmodSync,
   fstatSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   openSync,
@@ -35,6 +36,15 @@ function normalizeRow(row) {
 
 function sameFileIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+function fsyncDirectory(directoryPath) {
+  const descriptor = openSync(directoryPath, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 class NodeSqliteConnection {
@@ -146,6 +156,7 @@ export const nodeSqliteAdapter = assertStorageAdapter({
         options,
       );
       fchmodSync(descriptor, 0o600);
+      fsyncSync(descriptor);
       const stagedIdentity = lstatSync(stagingPath);
       if (!sameFileIdentity(openedIdentity, stagedIdentity)) {
         throw new Error("node:sqlite backup staging identity changed");
@@ -159,6 +170,7 @@ export const nodeSqliteAdapter = assertStorageAdapter({
       closeSync(descriptor);
       descriptor = null;
       unlinkSync(stagingPath);
+      fsyncDirectory(parentDirectory);
       return copiedPages;
     } catch (error) {
       if (descriptor != null) {

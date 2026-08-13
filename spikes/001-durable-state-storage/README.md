@@ -29,7 +29,8 @@ and a same-connection transaction committed while an incremental backup is in
 progress. Migration SQL is SHA-256 checked before its DDL and `schema_meta` row
 commit atomically. Backup creation requires a private parent directory, writes
 an exclusive hidden `0600` staging file, then publishes it with a no-overwrite
-hard link; existing paths and symlinks are never replaced.
+hard link; existing paths and symlinks are never replaced. Publication fsyncs
+the completed file and parent directory before reporting success.
 The restore-gate probe additionally rejects unexpected migration history,
 missing/stale virtual-ID anchors, and unresolved poll intents whose normalized
 external source-incarnation evidence does not match. Offset-zero intents are

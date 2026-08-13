@@ -109,6 +109,28 @@ test("one bot retains only the configured number of queued polls", async () => {
   assert.deepEqual(coordinator.snapshot(), []);
 });
 
+test("admission is bounded before request bodies become queued tasks", () => {
+  const coordinator = new PerBotPollCoordinator({ maxPendingPerBot: 1 });
+  const first = coordinator.reserve("bot:one");
+  const second = coordinator.reserve("bot:one");
+
+  assert.throws(
+    () => coordinator.reserve("bot:one"),
+    (error) => error?.code === "POLL_QUEUE_FULL",
+  );
+  assert.deepEqual(coordinator.snapshot(), [{
+    botKey: "bot:one",
+    active: false,
+    pending: 0,
+  }]);
+
+  first.release();
+  const replacement = coordinator.reserve("bot:one");
+  second.release();
+  replacement.release();
+  assert.deepEqual(coordinator.snapshot(), []);
+});
+
 test("aborting a queued poll removes it without blocking the next poll", async () => {
   const coordinator = new PerBotPollCoordinator();
   const firstGate = deferred();
