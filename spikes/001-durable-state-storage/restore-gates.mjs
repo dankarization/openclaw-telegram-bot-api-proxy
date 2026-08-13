@@ -172,12 +172,14 @@ export function verifyUnresolvedIntentIncarnations(
        bot_key,
        source,
        generation,
+       native_offset,
        incarnation_evidence_hmac
      FROM poll_intents
      WHERE status IN ('prepared', 'ambiguous')
      ORDER BY intent_id`,
   );
   for (const intent of unresolved) {
+    if (intent.native_offset === 0) continue;
     const key = sourceManifestKey(
       intent.bot_key,
       intent.source,

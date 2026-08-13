@@ -202,6 +202,49 @@ test("same-bot long polls are serialized before the upstream can return 409", as
   ]);
 });
 
+test("excess same-bot polls fail fast when the bounded queue is full", async (t) => {
+  const activeStarted = deferred();
+  const releaseActive = deferred();
+  let pollCalls = 0;
+  const harness = await startHarness(t, async (request) => {
+    if (request.method === "getMe") {
+      return json(200, { ok: true, result: { id: Number(request.botId) } });
+    }
+    if (request.method !== "getUpdates") return null;
+    pollCalls += 1;
+    if (pollCalls === 1) {
+      activeStarted.resolve();
+      await releaseActive.promise;
+    }
+    return json(200, { ok: true, result: [] });
+  }, {
+    MAX_QUEUED_GETUPDATES_PER_BOT: "1",
+  });
+  const token = "115115:bounded-queue-secret";
+
+  const active = poll(harness.proxyRoot, token);
+  await activeStarted.promise;
+  const queued = poll(harness.proxyRoot, token);
+  await new Promise((resolve) => setImmediate(resolve));
+  const excess = await poll(harness.proxyRoot, token);
+
+  assert.equal(excess.status, 429);
+  assert.equal(excess.payload.error_code, 429);
+  assert.match(excess.payload.description, /Too many concurrent getUpdates/u);
+  assert.equal(pollCalls, 1);
+  releaseActive.resolve();
+  assert.deepEqual(
+    (await Promise.all([active, queued])).map((result) => result.status),
+    [200, 200],
+  );
+  assert.equal(pollCalls, 2);
+  await waitForOutput(
+    harness.child,
+    harness.output,
+    "action=poll-queue-rejected status=429",
+  );
+});
+
 test("uppercase getUpdates keeps fail-closed cursor protection", async (t) => {
   const harness = await startHarness(t, async (request) => {
     if (request.method === "getMe" || request.method === "getUpdates") {

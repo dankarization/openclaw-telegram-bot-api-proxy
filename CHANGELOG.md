@@ -10,6 +10,8 @@
 - Serialize the complete `getUpdates` cycle in a FIFO lane per bot ID while
   preserving cross-bot concurrency. Queued client cancellations are removed;
   an already-started ambiguous upstream cycle keeps its lane until completion.
+- Bound each bot's retained polling queue and return HTTP 429 at the configured
+  limit instead of retaining unbounded buffered request bodies.
 - Canonicalize Telegram's case-insensitive method names before routing, so
   variants such as `GETUPDATES`, `GETFILE`, and `SETWEBHOOK` cannot bypass
   cursor guards, coordination, or local-only policy.
@@ -21,12 +23,17 @@
   injectable clock and fault points.
 - Record bot-scoped `file_id` source and optional size from successful
   `getUpdates`, including nested standard media fields and media groups.
+- Record media provenance only from the post-guard response, so filtered local
+  mirrors cannot overwrite previously delivered cloud provenance; prune the
+  metadata TTL cache once per batch.
 - Make `getFile` local-first independently of the short health probe, add
   bounded retry for explicit transient network failures, and fail fast instead
   of starting a long cloud request when update source/size policy blocks it.
 - Add frozen sequential routing traces and concurrency regressions covering
   same-bot overlap, cross-bot parallelism, cancellation, shutdown, and
   multipart local-only behavior.
+- Permit restore of non-destructive offset-zero poll intents without source
+  incarnation evidence, consistent with the durable schema.
 - Fallback `getFile` to cloud when local Bot API returns `400`, covering cloud
   fallback updates whose `file_id` is not known by the local API yet.
 - Bridge/virtualize local `update_id` values after cloud `getUpdates` fallback

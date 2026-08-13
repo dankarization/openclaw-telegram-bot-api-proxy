@@ -18,14 +18,29 @@ function closedError(reason) {
   return error;
 }
 
+function queueFullError(maxPendingPerBot) {
+  const error = new Error(
+    `getUpdates queue is full (${maxPendingPerBot} pending per bot)`,
+  );
+  error.name = "PollQueueFullError";
+  error.code = "POLL_QUEUE_FULL";
+  return error;
+}
+
 export class PerBotPollCoordinator {
   #closed = false;
   #closeReason = null;
   #lanes = new Map();
+  #maxPendingPerBot;
   #now;
   #onEvent;
 
   constructor(options = {}) {
+    const maxPendingPerBot = options.maxPendingPerBot ?? 4;
+    if (!Number.isSafeInteger(maxPendingPerBot) || maxPendingPerBot < 0) {
+      throw new TypeError("maxPendingPerBot must be a non-negative safe integer");
+    }
+    this.#maxPendingPerBot = maxPendingPerBot;
     this.#now = options.now || Date.now;
     this.#onEvent = options.onEvent || (() => {});
   }
@@ -57,6 +72,19 @@ export class PerBotPollCoordinator {
     }
 
     let lane = this.#lanes.get(botKey);
+    if (
+      lane
+      && (lane.active != null || lane.queue.length > 0)
+      && lane.queue.length >= this.#maxPendingPerBot
+    ) {
+      this.#emit({
+        type: "queue-full",
+        botKey,
+        pending: lane.queue.length,
+        maxPending: this.#maxPendingPerBot,
+      });
+      return Promise.reject(queueFullError(this.#maxPendingPerBot));
+    }
     if (!lane) {
       lane = { active: null, queue: [] };
       this.#lanes.set(botKey, lane);

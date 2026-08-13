@@ -72,6 +72,11 @@ const cloudGetUpdatesOnLocalEmptyEnabled = parseBoolean(process.env.ENABLE_CLOUD
 const localGetUpdatesTimeoutSeconds = parseNonNegativeInteger(process.env.LOCAL_GETUPDATES_TIMEOUT_SECONDS, 10);
 // Количество попыток local getUpdates перед тем, как отдать ошибку или уйти в cloud fallback.
 const localGetUpdatesMaxAttempts = parsePositiveInteger(process.env.LOCAL_GETUPDATES_MAX_ATTEMPTS, 4);
+// Ограничиваем retained FIFO queue по публичному bot ID, чтобы body burst не рос без границы.
+const maxQueuedGetUpdatesPerBot = parseNonNegativeInteger(
+  process.env.MAX_QUEUED_GETUPDATES_PER_BOT,
+  4,
+);
 // Базовая пауза между retry local getUpdates. Пауза растет экспоненциально.
 const localGetUpdatesRetryBaseMs = parseNonNegativeInteger(process.env.LOCAL_GETUPDATES_RETRY_BASE_MS, 300);
 // Отдельный сетевой timeout для local getUpdates, чтобы оборванный long poll не висел по общему upstream timeout.
@@ -124,10 +129,14 @@ const localRequestForGetUpdates = updateBridge.localRequestForGetUpdates.bind(up
 const emptySuccessfulGetUpdates = updateBridge.emptySuccessfulGetUpdates.bind(updateBridge);
 // Один bot получает ровно один полный getUpdates cycle; разные bot ID не блокируют друг друга.
 const pollCoordinator = new PerBotPollCoordinator({
+  maxPendingPerBot: maxQueuedGetUpdatesPerBot,
   now: runtimeHooks.now,
   onEvent(event) {
     if (event.type === "started" && event.queueWaitMs > 0) {
       log(`method=getUpdates action=poll-queue-start queueWaitMs=${event.queueWaitMs}`);
+    }
+    if (event.type === "queue-full") {
+      log(`method=getUpdates action=poll-queue-rejected pending=${event.pending} maxPending=${event.maxPending}`);
     }
   },
 });
@@ -153,8 +162,7 @@ const fallbackPolicy = createFallbackPolicy({
   fileRouter,
 });
 function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}) {
-  fileRouter.observeGetUpdatesResult(token, upstream, "cloud");
-  return updateBridge.guardedCloudGetUpdates(
+  const result = updateBridge.guardedCloudGetUpdates(
     req,
     method,
     token,
@@ -162,11 +170,24 @@ function guardedCloudGetUpdates(req, method, token, body, upstream, options = {}
     upstream,
     options,
   );
+  if (method === "getUpdates") {
+    fileRouter.observeGetUpdatesResult(token, result.upstream, "cloud");
+  }
+  return result;
 }
 
 function guardedLocalGetUpdates(req, method, token, body, upstream) {
-  fileRouter.observeGetUpdatesResult(token, upstream, "local");
-  return updateBridge.guardedLocalGetUpdates(req, method, token, body, upstream);
+  const result = updateBridge.guardedLocalGetUpdates(
+    req,
+    method,
+    token,
+    body,
+    upstream,
+  );
+  if (method === "getUpdates") {
+    fileRouter.observeGetUpdatesResult(token, result.upstream, "local");
+  }
+  return result;
 }
 
 const processGetFileResult = fileRouter.processGetFileResult.bind(fileRouter);
@@ -807,10 +828,25 @@ const server = http.createServer(async (req, res) => {
       await handleStreaming(req, res, method, token, startedAt);
     }
   } catch (error) {
-    logError(`method=${method} ${errorLogFields(error)}`);
+    const queueFull = error?.code === "POLL_QUEUE_FULL";
+    if (queueFull) {
+      log(`method=getUpdates action=poll-queue-rejected status=429`);
+    } else {
+      logError(`method=${method} ${errorLogFields(error)}`);
+    }
     if (!res.headersSent && !res.destroyed && !res.writableEnded) {
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, description: "Telegram Bot API proxy upstream failure" }));
+      const statusCode = queueFull ? 429 : 502;
+      res.writeHead(statusCode, {
+        "content-type": "application/json",
+        ...(queueFull ? { "retry-after": "1" } : {}),
+      });
+      res.end(JSON.stringify({
+        ok: false,
+        error_code: statusCode,
+        description: queueFull
+          ? "Too many concurrent getUpdates requests for this bot"
+          : "Telegram Bot API proxy upstream failure",
+      }));
     } else if (!res.destroyed && !res.writableEnded) {
       res.destroy(error);
     }
@@ -822,7 +858,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.

@@ -88,6 +88,8 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 - `target=local` - запрос ушел в локальный Bot API.
 - `target=cloud` - запрос ушел в cloud fallback.
 - `action=retry` - local `getUpdates` временно оборвался или вернул 5xx, proxy повторяет запрос перед fallback.
+- `action=poll-queue-rejected status=429` - для bot ID уже заполнена
+  ограниченная FIFO-очередь; новый poll быстро отклонён без обращения к upstream.
 - `method=getFile target=local action=retry` - обязательная local-попытка
   `getFile` временно оборвалась; proxy повторит её с ограниченным backoff.
 - `timeoutCapped=` - proxy снизил `getUpdates timeout` до `LOCAL_GETUPDATES_TIMEOUT_SECONDS`.

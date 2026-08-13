@@ -129,8 +129,18 @@ export class FileRouter {
       const payload = JSON.parse(upstream.body.toString("utf8"));
       if (!payload?.ok || !Array.isArray(payload.result)) return;
       const files = this.#collectUpdateFileInfo(payload.result);
+      const botId = botIdFromToken(token);
+      if (!botId) return;
+      const now = this.#now();
+      this.#pruneExpiredUpdateFileInfo(now);
       for (const [fileId, info] of files) {
-        this.#cacheUpdateFileInfo(token, fileId, info.fileSize, source);
+        this.#cacheUpdateFileInfo(
+          botId,
+          fileId,
+          info.fileSize,
+          source,
+          now,
+        );
       }
     } catch {
       // Metadata capture is best-effort and never changes the update response.
@@ -232,11 +242,8 @@ export class FileRouter {
     return info;
   }
 
-  #cacheUpdateFileInfo(token, fileId, fileSize, source) {
-    const botId = botIdFromToken(token);
+  #cacheUpdateFileInfo(botId, fileId, fileSize, source, now) {
     if (!botId || !fileId || (source !== "local" && source !== "cloud")) return;
-    const now = this.#now();
-    this.#pruneExpiredUpdateFileInfo(now);
     const key = `${botId}:${fileId}`;
     const previous = this.#fileUpdateInfoByBotIdAndId.get(key);
     const parsedFileSize = exactSafeNonNegativeInteger(fileSize);

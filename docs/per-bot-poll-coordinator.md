@@ -11,6 +11,9 @@ Production state: no SQLite reads or writes; legacy cursor decisions unchanged
 After its bounded body is fully buffered, every `getUpdates` request for one bot
 ID enters a FIFO lane before the proxy starts any upstream routing decision.
 Different bot IDs use independent lanes and may run concurrently.
+Each lane retains at most `MAX_QUEUED_GETUPDATES_PER_BOT` waiting polls (four by
+default). Further polls fail fast with HTTP 429 instead of retaining an
+unbounded number of buffered request bodies.
 
 The same topology is available as a standalone
 [SVG/HTML diagram](per-bot-poll-coordinator-diagram.html).
@@ -113,6 +116,7 @@ fingerprint suppression is introduced here.
 - all 18 baseline integration tests remain unchanged and pass;
 - a frozen raw POST/JSON routing trace from `c301f55` matches exactly;
 - same-bot concurrent polls reach upstream with maximum concurrency `1`;
+- excess same-bot polls receive HTTP 429 at the configured queue boundary;
 - the same scenario on `c301f55` demonstrates the former `409`;
 - two different bots reach upstream concurrently;
 - queued and active client disconnect paths behave as specified;

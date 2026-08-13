@@ -348,3 +348,28 @@ test("getUpdates media metadata expires at its independent TTL", () => {
     { allowed: false, reason: "file-id-source-unknown" },
   );
 });
+
+test("one getUpdates media batch samples the clock once", () => {
+  let clockReads = 0;
+  const router = createFileRouter({
+    now: () => {
+      clockReads += 1;
+      return 75_000;
+    },
+  });
+  const documents = Array.from({ length: 100 }, (_, index) => ({
+    file_id: `batch-file-${index}`,
+    file_size: index,
+  }));
+
+  router.observeGetUpdatesResult(
+    "101010:batch-secret-value",
+    getUpdatesResponse([{
+      update_id: 1,
+      message: { paid_media: documents },
+    }]),
+    "local",
+  );
+
+  assert.equal(clockReads, 1);
+});

@@ -56,6 +56,9 @@ sequenceDiagram
   check, local retries, stale-update guard, служебный `ack-dropped`, cloud probe
   и fallback остаются под одним FIFO lock. Разные боты продолжают polling
   параллельно.
+- FIFO хранит не больше `MAX_QUEUED_GETUPDATES_PER_BOT` ожидающих polls на bot
+  ID. Избыточный запрос быстро получает HTTP 429, поэтому buffered bodies не
+  накапливаются в очереди без границы.
 - Имена Bot API методов нормализуются без учёта регистра до выбора policy:
   `GETUPDATES`, `GETFILE` и `SETWEBHOOK` не обходят cursor guard, file routing
   или local-only ограничения.
@@ -184,6 +187,7 @@ Entrypoint импортирует соседние модули из `src/`. П�
 | `ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY` | `false` | Явно разрешить cloud pending rescue после успешного пустого local `getUpdates`. |
 | `LOCAL_GETUPDATES_TIMEOUT_SECONDS` | `10` | Максимальный `timeout` для local `getUpdates`; `0` отключает long poll. |
 | `LOCAL_GETUPDATES_MAX_ATTEMPTS` | `4` | Количество local-попыток `getUpdates` перед fallback/ошибкой. |
+| `MAX_QUEUED_GETUPDATES_PER_BOT` | `4` | Максимум ожидающих FIFO polls на один публичный bot ID; превышение возвращает 429. |
 | `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
 | `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |

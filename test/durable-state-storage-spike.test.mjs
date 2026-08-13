@@ -1149,6 +1149,34 @@ test("destructive ACK intents require a verified incarnation and one safe fronti
     ).length,
     1,
   );
+
+  insertBot(connection, "bot:offset-zero");
+  insertSource(connection, { botKey: "bot:offset-zero" });
+  connection.run(
+    `INSERT INTO poll_intents (
+      bot_key,
+      source,
+      generation,
+      incarnation_evidence_hmac,
+      native_offset,
+      status,
+      prepared_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ["bot:offset-zero", "local", 1, null, 0, "prepared", 1_007],
+  );
+  const unresolved = verifyUnresolvedIntentIncarnations(
+    connection,
+    new Map([[localManifestKey, Buffer.from("local-volume-epoch-1")]]),
+  );
+  assert.equal(unresolved.length, 2);
+  assert.equal(
+    unresolved.some((intent) => (
+      intent.bot_key === "bot:offset-zero"
+      && intent.native_offset === 0
+      && intent.incarnation_evidence_hmac == null
+    )),
+    true,
+  );
 });
 
 test("observed ACK frontiers stop at quarantined or non-terminal updates", async (t) => {

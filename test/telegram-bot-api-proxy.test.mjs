@@ -467,6 +467,80 @@ test("cloud-sourced file_id keeps cloud affinity after mandatory local getFile",
   });
 });
 
+test("a filtered local mirror cannot overwrite delivered cloud file provenance", async (t) => {
+  const token = "710105:filtered-mirror-secret-1234567890";
+  const fileId = "shared-cloud-file-no-size";
+  let phase = "cloud";
+  const harness = await startHarness(t, {
+    env: {
+      ENABLE_CLOUD_GETUPDATES_FALLBACK: "1",
+      ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY: "1",
+      CLOUD_PENDING_FALLBACK_DELAY_MS: "0",
+      LOCAL_GETUPDATES_MAX_ATTEMPTS: "1",
+      LOCAL_VIRTUAL_OFFSET_SKEW_MIN: "1",
+    },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        if (phase === "cloud") return json(200, { ok: true, result: [] });
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 5,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: fileId },
+            },
+          }],
+        });
+      }
+      if (request.kind === "api" && request.method === "getFile") {
+        return disconnect();
+      }
+      return null;
+    },
+    cloud: (request) => {
+      if (request.kind === "api" && request.method === "getWebhookInfo") {
+        return json(200, { ok: true, result: { pending_update_count: 1 } });
+      }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 10,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: fileId },
+            },
+          }],
+        });
+      }
+      if (request.kind === "api" && request.method === "getFile") {
+        return json(200, {
+          ok: true,
+          result: { file_path: "documents/preserved-cloud.bin", file_size: 1024 },
+        });
+      }
+      return healthyGetMe(request);
+    },
+  });
+
+  assert.deepEqual(
+    (await getUpdates(harness.proxyRoot, token, 1201)).map((update) => update.update_id),
+    [1201],
+  );
+  phase = "filtered-local-mirror";
+  assert.deepEqual(await getUpdates(harness.proxyRoot, token, 1202), []);
+
+  const file = await getFile(harness.proxyRoot, token, fileId);
+  assert.equal(file.file_path, "documents/preserved-cloud.bin");
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    1,
+  );
+});
+
 test("media metadata capture leaves seeded getUpdates offset virtualization unchanged", async (t) => {
   const token = "710106:offset-virtualization-secret-1234567890";
   const localOffsets = [];

@@ -32,7 +32,9 @@ an exclusive hidden `0600` staging file, then publishes it with a no-overwrite
 hard link; existing paths and symlinks are never replaced.
 The restore-gate probe additionally rejects unexpected migration history,
 missing/stale virtual-ID anchors, and unresolved poll intents whose normalized
-external source-incarnation evidence does not match.
+external source-incarnation evidence does not match. Offset-zero intents are
+non-destructive and may restore without incarnation evidence, matching the
+schema contract.
 
 `better-sqlite3` 13.0.1 also passed a one-time isolated WAL/reopen/backup smoke
 probe on Node v22.23.1. That external observation is not part of repository

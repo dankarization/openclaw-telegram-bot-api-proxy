@@ -76,6 +76,39 @@ test("polls for different bots remain concurrent", async () => {
   assert.deepEqual(coordinator.snapshot(), []);
 });
 
+test("one bot retains only the configured number of queued polls", async () => {
+  const events = [];
+  const coordinator = new PerBotPollCoordinator({
+    maxPendingPerBot: 1,
+    onEvent: (event) => events.push(event),
+  });
+  const activeGate = deferred();
+  const active = coordinator.run("bot:one", async () => activeGate.promise);
+  const queued = coordinator.run("bot:one", async () => "queued");
+
+  await assert.rejects(
+    coordinator.run("bot:one", async () => "excess"),
+    (error) => error?.code === "POLL_QUEUE_FULL",
+  );
+  assert.deepEqual(coordinator.snapshot(), [{
+    botKey: "bot:one",
+    active: true,
+    pending: 1,
+  }]);
+  assert.equal(
+    events.some((event) => (
+      event.type === "queue-full"
+      && event.pending === 1
+      && event.maxPending === 1
+    )),
+    true,
+  );
+
+  activeGate.resolve("active");
+  assert.deepEqual(await Promise.all([active, queued]), ["active", "queued"]);
+  assert.deepEqual(coordinator.snapshot(), []);
+});
+
 test("aborting a queued poll removes it without blocking the next poll", async () => {
   const coordinator = new PerBotPollCoordinator();
   const firstGate = deferred();
