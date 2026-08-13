@@ -83,8 +83,17 @@ sequenceDiagram
   смешать local/cloud update spaces и выбрать не тот voice/media file.
 - Старые local updates ниже OpenClaw offset отбрасываются и подтверждаются в
   local Bot API, чтобы они не возвращались снова.
-- `getFile` при local `400` повторяется через cloud: это покрывает file_id,
-  полученные из cloud fallback, которые локальный Bot API ещё не знает.
+- Из каждого успешного `getUpdates` proxy на время
+  `FILE_UPDATE_INFO_CACHE_TTL_MS` запоминает bot-scoped `file_id`, источник
+  update и, когда Telegram его прислал, `file_size`. Рекурсивный обход включает
+  стандартные media-поля и media groups.
+- `getFile` всегда сначала обращается к local API, даже если короткий health
+  check не успел за `LOCAL_HEALTH_TIMEOUT_MS`. Явная временная сетевая ошибка
+  получает ограниченный local retry с небольшим backoff.
+- После исчерпания local retry cloud `getFile` разрешён для cloud-sourced
+  `file_id` либо файла с известным размером не больше
+  `CLOUD_FILE_FALLBACK_MAX_BYTES`. Для local-sourced файла неизвестного размера,
+  неизвестного `file_id` и файла выше лимита fallback быстро завершается 503.
 - Успешный `getFile` на время `FILE_INFO_CACHE_TTL_MS` связывает `file_path`
   с его upstream: local path скачивается через local, cloud path через cloud.
 - Cloud `/file/...` разрешён только если размер известен из `getFile` и не
@@ -98,11 +107,15 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Request[getFile] --> Health{Local health state}
-    Health -->|healthy| Local[Запрос в local Bot API]
-    Health -->|cached unhealthy и fallback разрешён| Cloud[Запрос getFile через cloud]
+    Request[getFile + file_id] --> Metadata[Найти source и file_size<br/>из getUpdates cache]
+    Metadata --> Local[Запросить local Bot API<br/>независимо от health-check]
+    Local -->|временная сеть или timeout| Retry{Local attempts<br/>остались?}
+    Retry -->|да, backoff| Local
+    Retry -->|нет| Policy{Cloud fallback<br/>разрешён metadata policy?}
+    Local -->|policy-approved HTTP error| Policy
+    Policy -->|да| Cloud[Запрос getFile через cloud]
+    Policy -->|нет| Fast503[Быстрый 503<br/>без cloud-запроса]
     Local -->|успех| LocalCache[Запомнить local source affinity]
-    Local -->|разрешённая политикой ошибка| Cloud
     LocalCache --> LocalDownload[Скачать через local<br/>включая файлы больше 20 MiB]
     Cloud -->|успех| CloudCache[Запомнить cloud source affinity]
     CloudCache --> Size{Размер известен и<br/>не больше cloud-лимита?}
@@ -110,9 +123,11 @@ flowchart TD
     Size -->|нет| Block[Не выполнять cloud download]
 ```
 
-Типичный разрешённый переход для `getFile` — local HTTP 400 для `file_id` из
-cloud update. Также действуют общие policy-approved network/5xx fallback.
-Multipart upload через cloud никогда автоматически не повторяется.
+Типичный разрешённый переход для `getFile` — исчерпанные local retry или local
+HTTP 400 для `file_id` из cloud update либо для подтверждённо небольшого файла.
+Короткий health-check влияет на остальные методы, но не пропускает обязательную
+local-попытку `getFile`. Multipart upload через cloud автоматически не
+повторяется.
 
 ## Требования
 
@@ -137,6 +152,11 @@ ENABLE_CLOUD_FALLBACK=1 node src/telegram-bot-api-proxy.mjs
 systemd/openclaw-telegram-api-proxy.service.example
 ```
 
+Entrypoint импортирует соседние модули из `src/`. При установке нужно
+копировать/checkout весь каталог репозитория (как минимум весь `src/`), а не
+один `telegram-bot-api-proxy.mjs`. Пример unit ожидает checkout в
+`%h/.openclaw/lib/openclaw-telegram-bot-api-proxy`.
+
 ## Переменные окружения
 
 | Переменная | Значение по умолчанию | Назначение |
@@ -149,6 +169,10 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог legacy OpenClaw offset-файлов; новые OpenClaw могут хранить offset в SQLite. |
 | `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
 | `FILE_INFO_CACHE_TTL_MS` | `300000` | TTL bot-scoped связи `file_path` с local/cloud источником `getFile`. |
+| `FILE_UPDATE_INFO_CACHE_TTL_MS` | `1800000` | TTL bot-scoped метаданных `file_id` из `getUpdates`: источник и известный размер. |
+| `LOCAL_GETFILE_MAX_ATTEMPTS` | `3` | Количество обязательных local-попыток `getFile`. |
+| `LOCAL_GETFILE_RETRY_BASE_MS` | `250` | Базовый backoff между временными local-ошибками `getFile`; растёт экспоненциально. |
+| `LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одной local-попытки `getFile`. |
 | `LOCAL_FILE_PATH_REWRITE_FROM` | пусто | Контейнерный префикс file_path из local Bot API. |
 | `LOCAL_FILE_PATH_REWRITE_TO` | пусто | Host-префикс того же Docker volume для OpenClaw. |
 | `BUFFER_LIMIT_BYTES` | `8388608` | Лимит буферизации API-запроса. |

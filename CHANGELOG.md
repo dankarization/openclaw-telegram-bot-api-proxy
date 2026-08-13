@@ -19,6 +19,11 @@
 - Extract request parsing, fallback policy, file routing, legacy update
   bridging, and upstream transport into independently tested modules with an
   injectable clock and fault points.
+- Record bot-scoped `file_id` source and optional size from successful
+  `getUpdates`, including nested standard media fields and media groups.
+- Make `getFile` local-first independently of the short health probe, add
+  bounded retry for explicit transient network failures, and fail fast instead
+  of starting a long cloud request when update source/size policy blocks it.
 - Add frozen sequential routing traces and concurrency regressions covering
   same-bot overlap, cross-bot parallelism, cancellation, shutdown, and
   multipart local-only behavior.

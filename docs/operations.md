@@ -88,6 +88,8 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 - `target=local` - запрос ушел в локальный Bot API.
 - `target=cloud` - запрос ушел в cloud fallback.
 - `action=retry` - local `getUpdates` временно оборвался или вернул 5xx, proxy повторяет запрос перед fallback.
+- `method=getFile target=local action=retry` - обязательная local-попытка
+  `getFile` временно оборвалась; proxy повторит её с ограниченным backoff.
 - `timeoutCapped=` - proxy снизил `getUpdates timeout` до `LOCAL_GETUPDATES_TIMEOUT_SECONDS`.
 - `fallbackReason=local-unavailable` - network/timeout fallback; предварительный retry применяется к `getUpdates`.
 - `fallbackReason=local-5xx` - HTTP 5xx fallback; предварительный retry применяется к `getUpdates`.
@@ -97,6 +99,9 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 200 --no-pager
 - `action=virtualized-update-id` - cloud `update_id` поднят выше local offset.
 - `action=ack-dropped` - proxy подтвердил старые local updates, чтобы они не вернулись снова.
 - `action=fallback-blocked` - fallback запрещен политикой, например для `multipart/form-data`.
+- `method=getFile ... action=fallback-blocked ... status=503` - local retry
+  исчерпан или local вернул policy-approved ошибку, а cloud запрещён: файл
+  слишком большой, local-sourced с неизвестным размером или его metadata нет.
 - `localUpdateStateSeeds=` - число синтаксически проверенных local bridge anchors, загруженных при startup; это не доказывает, что anchor согласован с bot/account-scoped durable event-ID high-water.
 - `cause=` - вложенная причина Node `fetch`/socket ошибки, если она есть.
 - `dropped=` - proxy отфильтровал updates ниже OpenClaw offset.
@@ -116,4 +121,9 @@ LOCAL_FILE_PATH_REWRITE_FROM=/var/lib/telegram-bot-api
 LOCAL_FILE_PATH_REWRITE_TO=./var/telegram-bot-api
 ```
 
-`/file/...` уходит в cloud только для файлов с известным размером не больше `CLOUD_FILE_FALLBACK_MAX_BYTES`. Большие файлы и неизвестный размер остаются local-only.
+`getFile` всегда сначала идёт в local API и при явной временной сетевой ошибке
+использует ограниченный retry. Cloud `getFile` после этого разрешён только для
+cloud-sourced `file_id` или подтверждённо небольшого файла. `/file/...` уходит
+в cloud только для файлов с известным размером не больше
+`CLOUD_FILE_FALLBACK_MAX_BYTES`. Большие файлы и неизвестный размер остаются
+local-only.
