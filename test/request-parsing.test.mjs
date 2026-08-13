@@ -20,6 +20,7 @@ import {
   requestTimeoutValue,
   requestWithUrl,
   streamingKind,
+  telegramRouteFromPath,
   tokenFromPath,
 } from "../src/request-parsing.mjs";
 
@@ -38,18 +39,54 @@ function jsonBody(value) {
 
 test("Telegram path helpers preserve token, method, and decoded file path behavior", () => {
   assert.equal(tokenFromPath("/bot123:secret/getUpdates"), "123:secret");
+  assert.equal(tokenFromPath("/bot123%3Asecret/%67etUpdates"), "123:secret");
   assert.equal(tokenFromPath("/file/bot123:secret/voice/a.ogg"), "123:secret");
   assert.equal(tokenFromPath("/health"), "");
 
   assert.equal(methodFromPath("/bot123:secret/getUpdates"), "getUpdates");
+  assert.equal(methodFromPath("/bot123%3Asecret/%67etUpdates"), "getUpdates");
   assert.equal(methodFromPath("/bot123:secret/GETUPDATES"), "getUpdates");
   assert.equal(methodFromPath("/bot123:secret/gEtFiLe"), "getFile");
   assert.equal(methodFromPath("/bot123:secret/SETWEBHOOK"), "setWebhook");
+  assert.equal(methodFromPath("/bot123:secret/test/getUpdates"), "getUpdates");
   assert.equal(methodFromPath("/bot123:secret/sendMessage?chat_id=1"), "sendMessage");
   assert.equal(methodFromPath("/file/bot123:secret/voice/a.ogg"), "file");
   assert.equal(methodFromPath("/bot123:secret/"), "unknown");
   assert.equal(canonicalMethodName("LOGOUT"), "logOut");
   assert.equal(canonicalMethodName("customMethod"), "customMethod");
+  assert.deepEqual(
+    telegramRouteFromPath("/bot123:secret/bad%E0%A4%A"),
+    {
+      decodedPathname: null,
+      missingPathMethod: false,
+      method: "unknown",
+      token: "",
+      unsupportedTestDc: false,
+      validEncoding: false,
+    },
+  );
+  assert.deepEqual(
+    telegramRouteFromPath("/bot123%3Asecret/test/getUpdates"),
+    {
+      decodedPathname: "/bot123:secret/test/getUpdates",
+      missingPathMethod: false,
+      method: "getUpdates",
+      token: "123:secret",
+      unsupportedTestDc: true,
+      validEncoding: true,
+    },
+  );
+  assert.deepEqual(
+    telegramRouteFromPath("/bot123:secret/?method=getUpdates"),
+    {
+      decodedPathname: "/bot123:secret/?method=getUpdates",
+      missingPathMethod: true,
+      method: "unknown",
+      token: "123:secret",
+      unsupportedTestDc: false,
+      validEncoding: true,
+    },
+  );
 
   assert.equal(filePathFromPathname("/file/bot123:secret/folder%20name/a.ogg"), "folder name/a.ogg");
   assert.equal(filePathFromPathname("/file/bot123:secret/bad%E0%A4%A"), "bad%E0%A4%A");

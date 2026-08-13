@@ -43,7 +43,8 @@ async function startUpstream(handler) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://upstream.test");
-    const match = url.pathname.match(/^\/bot([^/]+)\/([^/]+)$/u);
+    const decodedPathname = decodeURIComponent(url.pathname);
+    const match = decodedPathname.match(/^\/bot([^/]+)\/([^/]+)$/u);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const request = {
@@ -184,7 +185,11 @@ test("same-bot long polls are serialized before the upstream can return 409", as
 
   const [first, second] = await Promise.all([
     poll(harness.proxyRoot, token),
-    poll(harness.proxyRoot, token, { apiMethod: "GETUPDATES" }),
+    poll(
+      harness.proxyRoot,
+      "111111%3Aserial-secret-value",
+      { apiMethod: "GETUPDATES" },
+    ),
   ]);
 
   assert.deepEqual([first.status, second.status], [200, 200]);
@@ -220,6 +225,60 @@ test("uppercase getUpdates keeps fail-closed cursor protection", async (t) => {
     harness.output,
     "fallbackReason=cloud-cursor-uninitialized",
   );
+});
+
+test("percent-encoded getUpdates keeps fail-closed cursor protection", async (t) => {
+  const harness = await startHarness(t, async (request) => {
+    if (request.method === "getMe" || request.method === "getUpdates") {
+      return { disconnect: true };
+    }
+    return null;
+  }, {
+    ENABLE_CLOUD_GETUPDATES_FALLBACK: "1",
+  });
+
+  const response = await fetch(
+    `${harness.proxyRoot}/bot131313:encoded-secret/%67etUpdates?offset=999999`,
+  );
+  assert.equal(response.status, 502);
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getUpdates").length,
+    0,
+  );
+  await waitForOutput(
+    harness.child,
+    harness.output,
+    "fallbackReason=cloud-cursor-uninitialized",
+  );
+});
+
+test("test-DC and argument-only Bot API methods fail closed before upstream", async (t) => {
+  const harness = await startHarness(t, async () => (
+    json(200, { ok: true, result: [] })
+  ));
+  const requests = [
+    fetch(
+      `${harness.proxyRoot}/bot141414:route-secret/test/getUpdates?offset=999999`,
+    ),
+    fetch(
+      `${harness.proxyRoot}/bot141414:route-secret/?method=getUpdates&offset=999999`,
+    ),
+    fetch(
+      `${harness.proxyRoot}/bot141414:route-secret/test/?method=setWebhook`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: "method=setWebhook&url=https%3A%2F%2Fexample.invalid",
+      },
+    ),
+  ];
+
+  assert.deepEqual(
+    (await Promise.all(requests)).map((response) => response.status),
+    [400, 400, 400],
+  );
+  assert.equal(harness.local.requests.length, 0);
+  assert.equal(harness.cloud.requests.length, 0);
 });
 
 test("different bot IDs keep independent long polls", async (t) => {

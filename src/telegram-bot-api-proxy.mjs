@@ -10,10 +10,9 @@ import {
   bodyWithOffsetAndTimeout,
   canBufferRequest,
   copyHeaders,
-  methodFromPath,
   numericOffset,
   streamingKind,
-  tokenFromPath,
+  telegramRouteFromPath,
 } from "./request-parsing.mjs";
 import { runtimeHooks } from "./runtime-hooks.mjs";
 import {
@@ -640,8 +639,9 @@ async function handleStreaming(req, res, method, token, startedAt) {
 const server = http.createServer(async (req, res) => {
   const startedAt = runtimeHooks.now();
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
-  const method = methodFromPath(pathname);
-  const token = tokenFromPath(pathname);
+  const route = telegramRouteFromPath(pathname);
+  const method = route.method;
+  const token = route.token;
   const clientController = new AbortController();
   const abortClient = () => {
     if (!clientController.signal.aborted) {
@@ -654,6 +654,24 @@ const server = http.createServer(async (req, res) => {
   req.once("aborted", abortClient);
   res.once("close", abortClosedResponse);
   try {
+    if (!route.validEncoding) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: false,
+        description: "Malformed percent-encoding in Telegram Bot API path",
+      }));
+      return;
+    }
+    if (route.unsupportedTestDc || route.missingPathMethod) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: false,
+        description: route.unsupportedTestDc
+          ? "Telegram Bot API test-DC routes are not supported by this proxy"
+          : "Telegram Bot API method must be present in the request path",
+      }));
+      return;
+    }
     if (method === "getUpdates") {
       // Buffer before lane acquisition: an incomplete or unauthenticated body
       // must not starve every valid poll for the public bot ID.

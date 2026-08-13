@@ -29,18 +29,61 @@ export function canonicalMethodName(method) {
   return CANONICAL_METHOD_BY_LOWERCASE.get(raw.toLowerCase()) || raw;
 }
 
+// tdlib percent-decodes the HTTP path before splitting token and Bot API method.
+// Parse both values from that one upstream-equivalent representation so encoded
+// aliases cannot create a second coordinator lane or bypass method policy.
+export function telegramRouteFromPath(pathname) {
+  let decodedPathname;
+  try {
+    decodedPathname = decodeURIComponent(String(pathname || ""));
+  } catch {
+    return {
+      decodedPathname: null,
+      missingPathMethod: false,
+      method: "unknown",
+      token: "",
+      unsupportedTestDc: false,
+      validEncoding: false,
+    };
+  }
+
+  const tokenMatch = decodedPathname.match(/^\/(?:file\/)?bot([^/]+)/u);
+  const botRouteMatch = decodedPathname.match(/^\/bot[^/]+(?:\/(.*))?$/u);
+  let methodSegment = botRouteMatch?.[1] || "";
+  let unsupportedTestDc = false;
+  if (methodSegment.startsWith("test/")) {
+    unsupportedTestDc = true;
+    methodSegment = methodSegment.slice("test/".length);
+  }
+  const methodMatch = methodSegment.match(/^([^/?#]+)/u);
+  const isFileRoute = decodedPathname.startsWith("/file/bot");
+  const missingPathMethod = Boolean(
+    tokenMatch
+    && !isFileRoute
+    && !methodMatch,
+  );
+  return {
+    decodedPathname,
+    missingPathMethod,
+    method: methodMatch
+      ? canonicalMethodName(methodMatch[1] || "unknown")
+      : isFileRoute
+        ? "file"
+        : "unknown",
+    token: tokenMatch ? tokenMatch[1] : "",
+    unsupportedTestDc,
+    validEncoding: true,
+  };
+}
+
 // Достаём bot token из Telegram API path вида /bot<TOKEN>/... или /file/bot<TOKEN>/....
 export function tokenFromPath(pathname) {
-  const match = pathname.match(/^\/(?:file\/)?bot([^/]+)/u);
-  return match ? match[1] : "";
+  return telegramRouteFromPath(pathname).token;
 }
 
 // Нормализуем имя Telegram API метода одинаково для buffered и streaming путей.
 export function methodFromPath(pathname) {
-  const botMatch = pathname.match(/^\/bot[^/]+\/([^/?#]+)/u);
-  if (botMatch) return canonicalMethodName(botMatch[1] || "unknown");
-  if (pathname.startsWith("/file/bot")) return "file";
-  return "unknown";
+  return telegramRouteFromPath(pathname).method;
 }
 
 // Вытаскиваем file_path из /file/bot<TOKEN>/<file_path>.
