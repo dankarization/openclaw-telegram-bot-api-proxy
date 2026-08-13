@@ -52,6 +52,19 @@ sequenceDiagram
 - Локальный Bot API всегда в приоритете.
 - Local `getUpdates` перед fallback ретраится несколько раз; краткий обрыв
   HTTP-соединения не должен валить Telegram provider.
+- Полный `getUpdates` cycle сериализуется отдельно для каждого bot ID: health
+  check, local retries, stale-update guard, служебный `ack-dropped`, cloud probe
+  и fallback остаются под одним FIFO lock. Разные боты продолжают polling
+  параллельно.
+- FIFO хранит не больше `MAX_QUEUED_GETUPDATES_PER_BOT` ожидающих polls на bot
+  ID. Слот резервируется до чтения request body, без захвата upstream lock;
+  избыточный запрос быстро получает HTTP 429, поэтому одновременные buffered
+  bodies не накапливаются без границы. Незавершённый body получает HTTP 408
+  через `GETUPDATES_BODY_READ_TIMEOUT_MS`, соединение закрывается, слот
+  освобождается.
+- Имена Bot API методов нормализуются без учёта регистра до выбора policy:
+  `GETUPDATES`, `GETFILE` и `SETWEBHOOK` не обходят cursor guard, file routing
+  или local-only ограничения.
 - Длительность long poll для local `getUpdates` ограничивается
   `LOCAL_GETUPDATES_TIMEOUT_SECONDS`; значение `0` отключает long poll и
   превращает его в short polling.
@@ -76,8 +89,19 @@ sequenceDiagram
   смешать local/cloud update spaces и выбрать не тот voice/media file.
 - Старые local updates ниже OpenClaw offset отбрасываются и подтверждаются в
   local Bot API, чтобы они не возвращались снова.
-- `getFile` при local `400` повторяется через cloud: это покрывает file_id,
-  полученные из cloud fallback, которые локальный Bot API ещё не знает.
+- Из каждого успешного `getUpdates` proxy на время
+  `FILE_UPDATE_INFO_CACHE_TTL_MS` запоминает bot-scoped `file_id`, источник
+  update и, когда Telegram его прислал, `file_size`. Рекурсивный обход включает
+  стандартные media-поля и media groups.
+- `getFile` всегда сначала обращается к local API, даже если короткий health
+  check не успел за `LOCAL_HEALTH_TIMEOUT_MS`. Явная временная сетевая ошибка
+  получает ограниченный local retry с небольшим backoff.
+- После исчерпания local retry cloud `getFile` разрешён для cloud-sourced
+  `file_id` либо файла с известным размером не больше
+  `CLOUD_FILE_FALLBACK_MAX_BYTES`. Для local-sourced файла неизвестного размера,
+  неизвестного `file_id` и файла выше лимита fallback быстро завершается 503.
+- Local `getFile` 401/404 сохраняются как ошибки аутентификации/маршрута, когда
+  cloud fallback фактически запрещён; они не маскируются retryable 503.
 - Успешный `getFile` на время `FILE_INFO_CACHE_TTL_MS` связывает `file_path`
   с его upstream: local path скачивается через local, cloud path через cloud.
 - Cloud `/file/...` разрешён только если размер известен из `getFile` и не
@@ -91,11 +115,15 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Request[getFile] --> Health{Local health state}
-    Health -->|healthy| Local[Запрос в local Bot API]
-    Health -->|cached unhealthy и fallback разрешён| Cloud[Запрос getFile через cloud]
+    Request[getFile + file_id] --> Metadata[Найти source и file_size<br/>из getUpdates cache]
+    Metadata --> Local[Запросить local Bot API<br/>независимо от health-check]
+    Local -->|временная сеть или timeout| Retry{Local attempts<br/>остались?}
+    Retry -->|да, backoff| Local
+    Retry -->|нет| Policy{Cloud fallback<br/>разрешён metadata policy?}
+    Local -->|policy-approved HTTP error| Policy
+    Policy -->|да| Cloud[Запрос getFile через cloud]
+    Policy -->|нет| Fast503[Быстрый 503<br/>без cloud-запроса]
     Local -->|успех| LocalCache[Запомнить local source affinity]
-    Local -->|разрешённая политикой ошибка| Cloud
     LocalCache --> LocalDownload[Скачать через local<br/>включая файлы больше 20 MiB]
     Cloud -->|успех| CloudCache[Запомнить cloud source affinity]
     CloudCache --> Size{Размер известен и<br/>не больше cloud-лимита?}
@@ -103,13 +131,16 @@ flowchart TD
     Size -->|нет| Block[Не выполнять cloud download]
 ```
 
-Типичный разрешённый переход для `getFile` — local HTTP 400 для `file_id` из
-cloud update. Также действуют общие policy-approved network/5xx fallback.
-Multipart upload через cloud никогда автоматически не повторяется.
+Типичный разрешённый переход для `getFile` — исчерпанные local retry или local
+HTTP 400 для `file_id` из cloud update либо для подтверждённо небольшого файла.
+Короткий health-check влияет на остальные методы, но не пропускает обязательную
+local-попытку `getFile`. Multipart upload через cloud автоматически не
+повторяется.
 
 ## Требования
 
-- Node.js 22+
+- Node.js `>=22.16.0 <23` (`node:sqlite.backup` is unavailable earlier in
+  Node 22 and in Node 23 before 23.8.0)
 - Docker-контейнер `aiogram/telegram-bot-api:latest` на `127.0.0.1:8081`
 - Docker Compose v2 для `docker-compose.example.yml`
 - OpenClaw Telegram `apiRoot`: `http://127.0.0.1:8082`
@@ -129,6 +160,11 @@ ENABLE_CLOUD_FALLBACK=1 node src/telegram-bot-api-proxy.mjs
 systemd/openclaw-telegram-api-proxy.service.example
 ```
 
+Entrypoint импортирует соседние модули из `src/`. При установке нужно
+копировать/checkout весь каталог репозитория (как минимум весь `src/`), а не
+один `telegram-bot-api-proxy.mjs`. Пример unit ожидает checkout в
+`%h/.openclaw/lib/openclaw-telegram-bot-api-proxy`.
+
 ## Переменные окружения
 
 | Переменная | Значение по умолчанию | Назначение |
@@ -141,6 +177,10 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `TELEGRAM_OFFSET_DIR` | `telegram` | Каталог legacy OpenClaw offset-файлов; новые OpenClaw могут хранить offset в SQLite. |
 | `CLOUD_FILE_FALLBACK_MAX_BYTES` | `20971520` | Лимит размера файла для cloud `/file/...`. |
 | `FILE_INFO_CACHE_TTL_MS` | `300000` | TTL bot-scoped связи `file_path` с local/cloud источником `getFile`. |
+| `FILE_UPDATE_INFO_CACHE_TTL_MS` | `1800000` | TTL bot-scoped метаданных `file_id` из `getUpdates`: источник и известный размер. |
+| `LOCAL_GETFILE_MAX_ATTEMPTS` | `3` | Количество обязательных local-попыток `getFile`. |
+| `LOCAL_GETFILE_RETRY_BASE_MS` | `250` | Базовый backoff между временными local-ошибками `getFile`; растёт экспоненциально. |
+| `LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одной local-попытки `getFile`. |
 | `LOCAL_FILE_PATH_REWRITE_FROM` | пусто | Контейнерный префикс file_path из local Bot API. |
 | `LOCAL_FILE_PATH_REWRITE_TO` | пусто | Host-префикс того же Docker volume для OpenClaw. |
 | `BUFFER_LIMIT_BYTES` | `8388608` | Лимит буферизации API-запроса. |
@@ -152,6 +192,8 @@ systemd/openclaw-telegram-api-proxy.service.example
 | `ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY` | `false` | Явно разрешить cloud pending rescue после успешного пустого local `getUpdates`. |
 | `LOCAL_GETUPDATES_TIMEOUT_SECONDS` | `10` | Максимальный `timeout` для local `getUpdates`; `0` отключает long poll. |
 | `LOCAL_GETUPDATES_MAX_ATTEMPTS` | `4` | Количество local-попыток `getUpdates` перед fallback/ошибкой. |
+| `MAX_QUEUED_GETUPDATES_PER_BOT` | `4` | Максимум ожидающих FIFO polls на один публичный bot ID; превышение возвращает 429. |
+| `GETUPDATES_BODY_READ_TIMEOUT_MS` | `5000` | Общий deadline чтения body `getUpdates`; превышение возвращает 408, закрывает соединение и освобождает admission slot. |
 | `LOCAL_GETUPDATES_RETRY_BASE_MS` | `300` | Базовая пауза между retry; растёт экспоненциально. |
 | `LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS` | `15000` | Сетевой timeout одного local `getUpdates` запроса. |
 | `CLOUD_PENDING_PROBE_TTL_MS` | `5000` | TTL проверки cloud pending updates. |
@@ -208,12 +250,17 @@ operator input при проверке или создании seed. Seed вос
   virtual IDs, а partial ACK не хранится как отдельное pending-состояние.
 - Нет persistent fingerprint ledger для семантической дедупликации зеркальных
   local/cloud updates.
-- Параллельные `getUpdates` одного bot пока не сериализуются внутри proxy.
+- Per-bot coordinator предотвращает конкурирующие polls только внутри одного
+  процесса proxy. Второй proxy, прямой consumer или webhook остаются внешними
+  конкурентами и всё ещё могут вызвать Telegram `409`.
 - Поэтому абсолютный exactly-once не заявляется; неизвестный cloud cursor по
   умолчанию приводит к fail-closed ошибке, сохраняя cloud backlog нетронутым.
 
 ## Документация
 
 - [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md) - архитектурный план.
+- [docs/durable-reconciliation-pr0.md](docs/durable-reconciliation-pr0.md) - PR 0: инварианты, simulator, storage spike и решения для durable state.
+- [docs/per-bot-poll-coordinator.md](docs/per-bot-poll-coordinator.md) - PR 1: границы lock, cancellation и differential gates.
+- [docs/durable-state-schema-v1.sql](docs/durable-state-schema-v1.sql) - проверяемая SQLite schema будущего StateStore.
 - [docs/token-migration.md](docs/token-migration.md) - переезд token между cloud/local/local.
 - [docs/operations.md](docs/operations.md) - проверки сервисов, очереди, durable high-water и логов.

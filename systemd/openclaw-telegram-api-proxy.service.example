@@ -15,6 +15,11 @@ Environment=CLOUD_API_ROOT=https://api.telegram.org
 Environment=ENABLE_CLOUD_FALLBACK=1
 Environment=TELEGRAM_OFFSET_DIR=telegram
 Environment=CLOUD_FILE_FALLBACK_MAX_BYTES=20971520
+Environment=FILE_INFO_CACHE_TTL_MS=300000
+Environment=FILE_UPDATE_INFO_CACHE_TTL_MS=1800000
+Environment=LOCAL_GETFILE_MAX_ATTEMPTS=3
+Environment=LOCAL_GETFILE_RETRY_BASE_MS=250
+Environment=LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS=15000
 Environment=LOCAL_FILE_PATH_REWRITE_FROM=/var/lib/telegram-bot-api
 Environment=LOCAL_FILE_PATH_REWRITE_TO=%h/.openclaw/var/telegram-bot-api
 Environment=BUFFER_LIMIT_BYTES=8388608
@@ -26,6 +31,8 @@ Environment=ENABLE_CLOUD_GETUPDATES_FALLBACK=1
 Environment=ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY=0
 Environment=LOCAL_GETUPDATES_TIMEOUT_SECONDS=10
 Environment=LOCAL_GETUPDATES_MAX_ATTEMPTS=4
+Environment=MAX_QUEUED_GETUPDATES_PER_BOT=4
+Environment=GETUPDATES_BODY_READ_TIMEOUT_MS=5000
 Environment=LOCAL_GETUPDATES_RETRY_BASE_MS=300
 Environment=LOCAL_GETUPDATES_UPSTREAM_TIMEOUT_MS=15000
 Environment=CLOUD_PENDING_PROBE_TTL_MS=5000
@@ -36,7 +43,7 @@ Environment=LOCAL_VIRTUAL_OFFSET_SKEW_MIN=1000000
 # For a new/re-anchored pair, virtualFloor must use this bot/account's durable event-ID high-water,
 # not a possibly lagging downstream ACK cursor.
 Environment=LOCAL_UPDATE_STATE_SEED=
-ExecStart=/usr/bin/node %h/.openclaw/bin/telegram-bot-api-proxy.mjs
+ExecStart=/usr/bin/node %h/.openclaw/lib/openclaw-telegram-bot-api-proxy/src/telegram-bot-api-proxy.mjs
 Restart=always
 RestartSec=3
 TimeoutStartSec=20

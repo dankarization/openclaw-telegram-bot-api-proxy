@@ -6,10 +6,10 @@
   "description": "Telegram Bot API proxy для OpenClaw с приоритетом локального API и безопасным cloud fallback.",
   "scripts": {
     "check": "npm run lint && npm test",
-    "lint": "node --check src/telegram-bot-api-proxy.mjs && node --check test/telegram-bot-api-proxy.test.mjs",
-    "test": "node --test test/telegram-bot-api-proxy.test.mjs"
+    "lint": "for file in src/*.mjs test/*.test.mjs test/support/*.mjs spikes/001-durable-state-storage/*.mjs; do node --check \"$file\" || exit 1; done",
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.16.0 <23"
   }
 }
