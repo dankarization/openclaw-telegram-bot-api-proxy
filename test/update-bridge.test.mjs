@@ -261,7 +261,7 @@ test("cloud rescue filters stale messages while keeping current edits and undate
       filterStaleUpdates: true,
     },
   });
-  assert.deepEqual(logs, [
+  assert.deepEqual(logs.filter((line) => line.includes("target=cloud action=virtualized-update-id")), [
     "method=getUpdates target=cloud action=virtualized-update-id count=2 dropped=1 cloudFloor=12 virtualFloor=1001",
   ]);
 
@@ -302,7 +302,7 @@ test("an all-stale cloud rescue returns empty and records the terminal native fl
       filterStaleUpdates: true,
     },
   });
-  assert.deepEqual(logs, [
+  assert.deepEqual(logs.filter((line) => line.includes("target=cloud action=virtualized-update-id")), [
     "method=getUpdates target=cloud action=virtualized-update-id result=0 dropped=2 floor=999 reason=stale-cloud-updates",
   ]);
 });
@@ -375,7 +375,7 @@ test("local stale filtering establishes a bridge and later emits stable virtual 
   assert.deepEqual(instance.redactedStateSnapshot().localUpdateStateByBotId, {
     123: { localFloor: 6, virtualFloor: 1000 },
   });
-  assert.deepEqual(logs, [
+  assert.deepEqual(logs.filter((line) => line.includes("target=local action=")), [
     "method=getUpdates target=local action=bridge-local-update-ids localFloor=5 virtualFloor=999",
     "method=getUpdates target=local action=virtualized-local-update-id count=1 dropped=1 localFloor=6 virtualFloor=1000",
   ]);

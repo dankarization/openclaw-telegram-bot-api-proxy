@@ -468,11 +468,7 @@ class LegacyUpdateBridge {
       return false;
     }
     try {
-      const payload = this.#normalizeInboundUpdates(
-        JSON.parse(upstream.body.toString("utf8")),
-        "local",
-      );
-      upstream = this.#jsonResponse(upstream, payload);
+      const payload = JSON.parse(upstream.body.toString("utf8"));
       return Boolean(
         payload?.ok
         && Array.isArray(payload.result)
@@ -574,7 +570,11 @@ class LegacyUpdateBridge {
       };
     }
     try {
-      const payload = JSON.parse(upstream.body.toString("utf8"));
+      const payload = this.#normalizeInboundUpdates(
+        JSON.parse(upstream.body.toString("utf8")),
+        "local",
+      );
+      upstream = this.#jsonResponse(upstream, payload);
       if (!payload?.ok || !Array.isArray(payload.result)) {
         return {
           upstream,
