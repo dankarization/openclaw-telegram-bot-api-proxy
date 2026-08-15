@@ -1,15 +1,15 @@
 {
   "name": "openclaw-telegram-bot-api-proxy",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Telegram Bot API proxy для OpenClaw с приоритетом локального API и безопасным cloud fallback.",
+  "description": "Production local-first Telegram Bot API proxy for OpenClaw with guarded cloud fallback.",
   "scripts": {
     "check": "npm run lint && npm test",
-    "lint": "for file in src/*.mjs test/*.test.mjs test/support/*.mjs spikes/001-durable-state-storage/*.mjs; do node --check \"$file\" || exit 1; done",
+    "lint": "for file in src/*.mjs test/*.test.mjs; do node --check \"$file\" || exit 1; done",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=22.16.0 <23"
+    "node": ">=22"
   }
 }
