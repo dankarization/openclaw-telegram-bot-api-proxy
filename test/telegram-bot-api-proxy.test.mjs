@@ -169,6 +169,7 @@ async function startHarness(t, options) {
       LOCAL_GETFILE_MAX_ATTEMPTS: "3",
       LOCAL_GETFILE_RETRY_BASE_MS: "1",
       LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS: "250",
+      LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS: "250",
       LOCAL_GETUPDATES_TIMEOUT_SECONDS: "10",
       LOCAL_GETUPDATES_MAX_ATTEMPTS: "4",
       LOCAL_GETUPDATES_RETRY_BASE_MS: "300",
@@ -318,11 +319,24 @@ test("getFile retries local ETIMEDOUT and succeeds without cloud", async (t) => 
           },
         });
       }
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 1,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: "retry-local-file", file_size: 2048 },
+            },
+          }],
+        });
+      }
       return null;
     },
     cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
   });
 
+  await getUpdates(harness.proxyRoot, token, 0);
   const file = await getFile(harness.proxyRoot, token, "retry-local-file");
   assert.equal(file.file_path, "/host-data/retried.jpg");
   assert.equal(attempts, 2);
@@ -332,7 +346,62 @@ test("getFile retries local ETIMEDOUT and succeeds without cloud", async (t) => 
   );
   assert.match(
     harness.output.value,
-    /method=getFile target=local action=retry attempt=1 reason=ETIMEDOUT/u,
+    /method=getFile target=local action=retry attempt=1 timeoutMode=fallback-window reason=ETIMEDOUT/u,
+  );
+});
+
+test("large local getFile uses the long download window instead of the fast fallback timeout", async (t) => {
+  const token = "710108:cold-large-file-secret-1234567890";
+  const fileId = "cold-four-gib-file";
+  const harness = await startHarness(t, {
+    env: {
+      LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS: "20",
+      LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS: "250",
+    },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [{
+            update_id: 1,
+            message: {
+              date: Math.floor(Date.now() / 1000),
+              document: { file_id: fileId, file_size: 4 * 1024 * 1024 * 1024 },
+            },
+          }],
+        });
+      }
+      if (request.kind === "api" && request.method === "getFile") {
+        return delayed(80, json(200, {
+          ok: true,
+          result: {
+            file_path: "/container-data/cold/four-gib.bin",
+            file_size: 4 * 1024 * 1024 * 1024,
+          },
+        }));
+      }
+      return null;
+    },
+    cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
+  });
+
+  await getUpdates(harness.proxyRoot, token, 0);
+  const file = await getFile(harness.proxyRoot, token, fileId);
+  assert.equal(file.file_path, "/host-data/cold/four-gib.bin");
+  assert.equal(
+    harness.local.requests.filter((request) => request.method === "getFile").length,
+    1,
+  );
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "getFile").length,
+    0,
+  );
+  await waitForOutput(harness.output, "timeoutMode=download-window");
+  assert.match(
+    harness.output.value,
+    /method=getFile target=local status=200 timeoutMode=download-window/u,
   );
 });
 

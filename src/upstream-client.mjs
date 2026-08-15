@@ -51,6 +51,9 @@ export function createUpstreamClient(options = {}) {
   }
 
   async function forwardBuffered(req, root, body, reqUrl = req.url, requestOptions = {}) {
+    if (requestOptions.nativeHttp === true) {
+      return forwardBufferedNative(req, root, body, reqUrl, requestOptions);
+    }
     const url = `${root}${reqUrl}`;
     const controller = new AbortController();
     const timeoutMs = requestOptions.timeoutMs ?? upstreamTimeoutMs;
@@ -89,6 +92,81 @@ export function createUpstreamClient(options = {}) {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  function forwardBufferedNative(req, root, body, reqUrl = req.url, requestOptions = {}) {
+    return new Promise((resolve, reject) => {
+      const url = targetUrl(root, reqUrl);
+      const client = url.protocol === "https:" ? httpsModule : httpModule;
+      const timeoutMs = requestOptions.timeoutMs ?? upstreamTimeoutMs;
+      const traceContext = {
+        method: requestOptions.method || "unknown",
+        target: requestOptions.target || "unknown",
+      };
+      let settled = false;
+      let timeout;
+      let upstreamReq;
+
+      const cleanup = () => {
+        if (timeout) clearTimeout(timeout);
+        requestOptions.signal?.removeEventListener("abort", onAbort);
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const onAbort = () => {
+        upstreamReq?.destroy(requestOptions.signal.reason);
+      };
+
+      Promise.resolve(hooks.fault("before-upstream-request", traceContext)).then(() => {
+        if (requestOptions.signal?.aborted) throw requestOptions.signal.reason;
+        const headers = copyHeaders(req.headers);
+        if (body.length === 0) delete headers["content-length"];
+        else headers["content-length"] = String(body.length);
+        upstreamReq = client.request({
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: url.port,
+          path: `${url.pathname}${url.search}`,
+          method: req.method,
+          headers,
+        }, (upstreamRes) => {
+          const chunks = [];
+          upstreamRes.on("data", (chunk) => chunks.push(chunk));
+          upstreamRes.once("aborted", () => {
+            finish(reject, Object.assign(new Error("upstream response aborted"), { code: "ECONNRESET" }));
+          });
+          upstreamRes.once("error", (error) => finish(reject, error));
+          upstreamRes.once("end", () => {
+            Promise.resolve(hooks.fault("after-upstream-response", {
+              ...traceContext,
+              statusCode: upstreamRes.statusCode || 0,
+            })).then(() => {
+              finish(resolve, {
+                statusCode: upstreamRes.statusCode || 0,
+                headers: copyHeaders(upstreamRes.headers),
+                body: Buffer.concat(chunks),
+              });
+            }).catch((error) => finish(reject, error));
+          });
+        });
+        requestOptions.signal?.addEventListener("abort", onAbort, { once: true });
+        upstreamReq.once("error", (error) => finish(reject, error));
+        if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+          timeout = setTimeout(() => {
+            upstreamReq.destroy(Object.assign(new Error("upstream timeout"), { code: "ETIMEDOUT" }));
+          }, timeoutMs);
+          timeout.unref?.();
+        }
+        const requestBody = body.length > 0 && req.method !== "GET" && req.method !== "HEAD"
+          ? body
+          : undefined;
+        upstreamReq.end(requestBody);
+      }).catch((error) => finish(reject, error));
+    });
   }
 
   function forwardStreaming(req, res, root, requestOptions = {}) {
