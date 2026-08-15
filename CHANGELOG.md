@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 — 2026-08-15
+
+- Heavy, local-only and unknown `getFile` requests use a shared two-hour cold
+  download window instead of three 15-second attempts.
+- The cold path uses the native Node HTTP client, avoiding Undici's shorter
+  response-header timeout.
+- Cloud-eligible files retain the fast bounded local retry before fallback.
+- Document the required OpenClaw `channels.telegram.timeoutSeconds` margin so
+  its client does not abort a cold local download before the proxy.
+
 ## 1.0.0 — 2026-08-14
 
 - Modular Node.js proxy with independently tested request parsing, fallback

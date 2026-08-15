@@ -64,6 +64,13 @@ const localGetFileUpstreamTimeoutMs = parsePositiveInteger(
   process.env.LOCAL_GETFILE_UPSTREAM_TIMEOUT_MS,
   15000,
 );
+// Общее окно ожидания cold download для heavy/unknown getFile, которому cloud
+// fallback всё равно запрещён. Попытки делят одно окно, чтобы retry не умножал
+// максимальную задержку.
+const localGetFileDownloadTimeoutMs = parsePositiveInteger(
+  process.env.LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS,
+  2 * 60 * 60 * 1000,
+);
 // Разрешает аварийный cloud fallback именно для getUpdates после local retry.
 const cloudGetUpdatesFallbackEnabled = parseBoolean(process.env.ENABLE_CLOUD_GETUPDATES_FALLBACK, true);
 // Разрешает rescue cloud backlog после успешного пустого local getUpdates; только явный opt-in.
@@ -449,13 +456,21 @@ function getFileRetryDelayMs(attempt) {
 
 async function forwardLocalBuffered(req, method, token, body, options = {}) {
   if (method === "getFile") {
+    const useDownloadWindow = options.getFileUseDownloadWindow === true;
+    const downloadDeadline = useDownloadWindow
+      ? runtimeHooks.now() + localGetFileDownloadTimeoutMs
+      : null;
     for (let attempt = 1; attempt <= localGetFileMaxAttempts; attempt += 1) {
+      const timeoutMs = downloadDeadline == null
+        ? localGetFileUpstreamTimeoutMs
+        : Math.max(1, downloadDeadline - runtimeHooks.now());
       try {
         const upstream = await forwardBuffered(req, localRoot, body, req.url, {
           method,
           signal: options.signal,
           target: "local",
-          timeoutMs: localGetFileUpstreamTimeoutMs,
+          timeoutMs,
+          nativeHttp: useDownloadWindow,
         });
         if (upstream.statusCode < 500) markLocalHealthy();
         return {
@@ -464,14 +479,18 @@ async function forwardLocalBuffered(req, method, token, body, options = {}) {
           body,
           attempts: attempt,
           timeoutCapped: false,
-          timeout: localGetFileUpstreamTimeoutMs,
+          timeout: timeoutMs,
+          timeoutMode: useDownloadWindow ? "download-window" : "fallback-window",
         };
       } catch (error) {
         if (!isClearlyLocalUnavailable(error) || attempt >= localGetFileMaxAttempts) {
           throw error;
         }
         const waitMs = getFileRetryDelayMs(attempt);
-        log(`method=getFile target=local action=retry attempt=${attempt} ${errorLogFields(error)} waitMs=${waitMs}`);
+        if (downloadDeadline != null && runtimeHooks.now() + waitMs >= downloadDeadline) {
+          throw error;
+        }
+        log(`method=getFile target=local action=retry attempt=${attempt} timeoutMode=${useDownloadWindow ? "download-window" : "fallback-window"} ${errorLogFields(error)} waitMs=${waitMs}`);
         await sleep(waitMs, options.signal);
       }
     }
@@ -603,7 +622,10 @@ async function handleBuffered(req, res, method, token, startedAt, options = {}) 
   }
 
   try {
-    const localAttempt = await forwardLocalBuffered(req, method, token, body, { signal });
+    const localAttempt = await forwardLocalBuffered(req, method, token, body, {
+      signal,
+      getFileUseDownloadWindow: method === "getFile" && !cloudFallbackAllowed,
+    });
     const localReq = localAttempt.req;
     const localBody = localAttempt.body;
     const localRaw = localAttempt.upstream;
@@ -719,7 +741,7 @@ async function handleBuffered(req, res, method, token, startedAt, options = {}) 
       }
     }
     writeBufferedResponse(res, local);
-    log(`method=${method} target=local status=${local.statusCode}${localAttempt.attempts > 1 ? ` attempts=${localAttempt.attempts}` : ""}${localAttempt.timeoutCapped ? ` timeoutCapped=${localAttempt.timeout}` : ""}${localAttempt.translatedOffset ? " translatedOffset=yes" : ""}${localGuard.dropped ? ` dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"}` : ""}${localGuard.translated ? " translatedLocal=yes" : ""}${localGuard.bridged ? " bridgedLocal=yes" : ""} ms=${Date.now() - startedAt}`);
+    log(`method=${method} target=local status=${local.statusCode}${localAttempt.attempts > 1 ? ` attempts=${localAttempt.attempts}` : ""}${localAttempt.timeoutMode ? ` timeoutMode=${localAttempt.timeoutMode}` : ""}${localAttempt.timeoutCapped ? ` timeoutCapped=${localAttempt.timeout}` : ""}${localAttempt.translatedOffset ? " translatedOffset=yes" : ""}${localGuard.dropped ? ` dropped=${localGuard.dropped} floor=${localGuard.floor ?? "none"}` : ""}${localGuard.translated ? " translatedLocal=yes" : ""}${localGuard.bridged ? " bridgedLocal=yes" : ""} ms=${Date.now() - startedAt}`);
   } catch (error) {
     if (cloudFallbackAllowed && isClearlyLocalUnavailable(error)) {
       markLocalUnhealthy(errorReason(error));
@@ -911,7 +933,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} getUpdatesBodyReadTimeoutMs=${getUpdatesBodyReadTimeoutMs} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} getUpdatesBodyReadTimeoutMs=${getUpdatesBodyReadTimeoutMs} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileDownloadTimeoutMs=${localGetFileDownloadTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.

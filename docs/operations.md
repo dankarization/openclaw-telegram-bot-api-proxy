@@ -14,6 +14,9 @@
   контейнер видит как `/var/lib/telegram-bot-api`.
 - Принимаемый OpenClaw размер media задан отдельно через
   `channels.telegram.mediaMaxMb`.
+- `channels.telegram.timeoutSeconds` больше
+  `LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS / 1000`; для default 7 200 000 мс
+  используется не менее 7 500 секунд.
 
 ## Read-only проверка
 
@@ -57,6 +60,7 @@ poll может конкурировать с основным consumer и по�
 ```bash
 jq '{
   mediaMaxMb: .channels.telegram.mediaMaxMb,
+  timeoutSeconds: .channels.telegram.timeoutSeconds,
   accounts: (
     .channels.telegram.accounts
     | to_entries
@@ -129,9 +133,12 @@ Local response может содержать absolute path. Proxy должен �
 1. Local Bot API вернул HTTP 200.
 2. Переписанный host path доступен Gateway и входит в trusted local roots.
 3. `channels.telegram.mediaMaxMb` не ниже фактического размера.
+4. `channels.telegram.timeoutSeconds * 1000` больше
+   `LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS`.
 
 Если пункт 1 прошёл, а OpenClaw пишет `MediaFetchError` или общий warning о
-скачивании, сначала сравните размер с `mediaMaxMb`.
+скачивании, сравните размер с `mediaMaxMb`. Если `getFile` обрывается до HTTP
+200, сравните клиентский `timeoutSeconds` с download window proxy.
 
 ### Cloud fallback blocked
 
@@ -176,9 +183,12 @@ git diff --check
 3. Устанавливайте весь tracked tree или как минимум весь `src/`; один entrypoint
    без соседних модулей не запустится.
 4. Проверьте `systemd-analyze --user verify` для unit.
-5. Если `apiRoot` уже указывает на `:8082`, достаточно `daemon-reload` и restart
-   только proxy service. Gateway и local Bot API для замены proxy bundle не
-   требуют restart.
+5. Если `apiRoot` уже указывает на `:8082`, для замены одного proxy bundle
+   достаточно `daemon-reload` и restart только proxy service. При первом
+   включении длинного `getFile` отдельно задайте OpenClaw
+   `channels.telegram.timeoutSeconds`; default hybrid reload перезапустит
+   Telegram channel без restart всего Gateway process. Local Bot API restart не
+   требуется.
 6. После restart проверьте process, listeners, `NRestarts`, `getMe` canary для
    каждого enabled account и error markers в логах.
 7. При провале верните целиком предыдущий bundle и unit, затем перезапустите

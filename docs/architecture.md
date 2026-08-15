@@ -18,8 +18,9 @@ flowchart LR
 ### OpenClaw Gateway
 
 Каждый Telegram account использует proxy как `apiRoot`. Gateway управляет
-sessions, durable ingress и прикладным лимитом `mediaMaxMb`. Он не знает о
-local/cloud source affinity.
+sessions, durable ingress, прикладным лимитом `mediaMaxMb` и клиентским
+`timeoutSeconds`. Последний должен быть длиннее proxy download window. Gateway
+не знает о local/cloud source affinity.
 
 ### Proxy
 
@@ -141,11 +142,19 @@ Proxy не читает SQLite/spool OpenClaw автоматически. Про
 
 ### `getFile`
 
-`getFile` не доверяет короткому health-check и всегда начинает с local API:
+`getFile` не доверяет короткому health-check и всегда начинает с local API.
+Дальше timeout зависит от того, допустим ли cloud fallback:
 
-1. до трёх попыток;
-2. 15 секунд на попытку;
-3. backoff 250 и 500 мс между временными ошибками.
+1. cloud-sourced или подтверждённо малый файл получает до трёх быстрых local
+   попыток, по 15 секунд каждая;
+2. тяжёлый, local-only или неизвестный файл получает общее
+   `LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS` на все попытки — два часа по умолчанию;
+3. временные ошибки получают backoff 250 и 500 мс, но не продлевают общее
+   download window.
+
+Длинный путь использует Node HTTP transport напрямую. Это снимает скрытый
+пятиминутный timeout ожидания response headers, который есть у стандартного
+Node/Undici `fetch`; верхней границей остаётся явное download window proxy.
 
 После local failure cloud разрешён, если `file_id` пришёл из cloud update или
 если известный размер не превышает `CLOUD_FILE_FALLBACK_MAX_BYTES`. Для local
@@ -161,7 +170,9 @@ LOCAL_FILE_PATH_REWRITE_TO=<тот же volume на host>
 ```
 
 OpenClaw может прочитать такой путь напрямую. Его собственный `mediaMaxMb`
-проверяется после этого и должен быть настроен отдельно.
+проверяется после этого и должен быть настроен отдельно. OpenClaw
+`channels.telegram.timeoutSeconds` также должен превышать download window;
+для default 7 200 000 мс рекомендуется не менее 7 500 секунд.
 
 ### `/file/...`
 

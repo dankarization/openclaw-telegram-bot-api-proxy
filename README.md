@@ -65,8 +65,10 @@ flowchart LR
 
 1. Из успешного `getUpdates` proxy на 30 минут запоминает bot-scoped `file_id`,
    источник и известный `file_size`.
-2. `getFile` делает до трёх local-попыток с 15-секундным timeout и коротким
-   backoff. Короткий health-check не может пропустить этот local-first путь.
+2. `getFile`, которому разрешён cloud fallback, делает до трёх быстрых
+   15-секундных local-попыток. Тяжёлый или неизвестный файл, который обязан
+   остаться local, получает отдельное общее окно скачивания: два часа по
+   умолчанию на все попытки. Короткий health-check на это окно не влияет.
 3. Успешный local `file_path` переписывается из контейнерного префикса в путь
    host-mounted volume, доступный OpenClaw.
 4. Связь `file_path → upstream` хранится пять минут. Поэтому последующий
@@ -74,16 +76,17 @@ flowchart LR
 5. Cloud-download разрешён только для cloud-sourced файла с известным размером
    не выше `CLOUD_FILE_FALLBACK_MAX_BYTES` (по умолчанию 20 MiB).
 
-Лимит OpenClaw `channels.telegram.mediaMaxMb` независим от proxy. Если он ниже
-размера файла, local Bot API и proxy успешно вернут `getFile`, после чего уже
-OpenClaw отклонит media. Для установки с локальным Bot API значение задаётся
-отдельно; пример для 4 GiB:
+У OpenClaw есть два независимых ограничения: `mediaMaxMb` и клиентский
+`timeoutSeconds`. Первый должен вместить файл, второй — быть больше
+`LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS`, иначе OpenClaw оборвёт HTTP-запрос раньше
+proxy. Пример для 4 GiB и двухчасового окна proxy с пятиминутным запасом:
 
 ```json
 {
   "channels": {
     "telegram": {
-      "mediaMaxMb": 4096
+      "mediaMaxMb": 4096,
+      "timeoutSeconds": 7500
     }
   }
 }
@@ -95,6 +98,8 @@ OpenClaw отклонит media. Для установки с локальным
 - local Telegram Bot API в режиме `--local` на loopback-интерфейсе;
 - persistent `/var/lib/telegram-bot-api` volume;
 - OpenClaw Telegram `apiRoot`: `http://127.0.0.1:8082`;
+- OpenClaw Telegram `timeoutSeconds` больше proxy
+  `LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS / 1000`;
 - корректный host path в `LOCAL_FILE_PATH_REWRITE_TO`.
 
 ## Запуск
@@ -110,7 +115,7 @@ ENABLE_CLOUD_FALLBACK=1 node src/telegram-bot-api-proxy.mjs
 `systemd/openclaw-telegram-api-proxy.service.example`. Entrypoint импортирует
 соседние модули, поэтому устанавливается весь каталог `src/`, а не один файл.
 
-Минимальная настройка OpenClaw:
+Минимальная настройка OpenClaw account:
 
 ```json
 {

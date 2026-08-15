@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import http from "node:http";
 import test from "node:test";
 
 import { createRuntimeHooks } from "../src/runtime-hooks.mjs";
@@ -101,6 +103,50 @@ test("buffered client preserves request/response bytes and exposes token-free fa
   ]);
   assert.equal(JSON.stringify(calls).includes("1:x"), true);
   assert.equal(JSON.stringify(calls.filter(([kind]) => kind === "fault")).includes("1:x"), false);
+});
+
+test("native buffered transport bypasses fetch and permits delayed response headers", async (t) => {
+  const server = http.createServer(async (req, res) => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "x-native-http": "yes",
+    });
+    res.end('{"ok":true}');
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(async () => {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  });
+  const address = server.address();
+  assert(address && typeof address !== "string");
+
+  const client = createUpstreamClient({
+    upstreamTimeoutMs: 200,
+    fetchImpl: async () => {
+      throw new Error("fetch transport must not be used");
+    },
+  });
+  const result = await client.forwardBuffered(
+    request(),
+    `http://127.0.0.1:${address.port}`,
+    Buffer.alloc(0),
+    undefined,
+    {
+      method: "getFile",
+      target: "local",
+      timeoutMs: 200,
+      nativeHttp: true,
+    },
+  );
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.headers["content-type"], "application/json");
+  assert.equal(result.headers["x-native-http"], "yes");
+  assert.deepEqual(result.body, Buffer.from('{"ok":true}'));
 });
 
 test("buffered client forwards coordinator shutdown cancellation", async () => {
