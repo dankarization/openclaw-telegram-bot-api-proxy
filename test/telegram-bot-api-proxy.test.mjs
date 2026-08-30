@@ -52,7 +52,13 @@ function parseUpstreamRequest(req) {
 async function startUpstream(target, handler) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
-    const request = { target, ...parseUpstreamRequest(req) };
+    const clientController = new AbortController();
+    req.once("aborted", () => clientController.abort());
+    const request = {
+      target,
+      ...parseUpstreamRequest(req),
+      clientSignal: clientController.signal,
+    };
     requests.push(request);
     let response;
     try {
@@ -403,6 +409,46 @@ test("large local getFile uses the long download window instead of the fast fall
     harness.output.value,
     /method=getFile target=local status=200 timeoutMode=download-window/u,
   );
+});
+
+test("downstream disconnect cancels a long local-only getFile native request", async (t) => {
+  const token = "710109:cancel-long-getfile-secret-1234567890";
+  let getFileStarted;
+  const getFileReceived = new Promise((resolve) => { getFileStarted = resolve; });
+  let upstreamAbort;
+  const upstreamAborted = new Promise((resolve) => { upstreamAbort = resolve; });
+  const harness = await startHarness(t, {
+    env: {
+      LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS: "10000",
+    },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.kind === "api" && request.method === "getFile") {
+        request.clientSignal.addEventListener("abort", upstreamAbort, { once: true });
+        getFileStarted();
+        return delayed(1000, json(200, {
+          ok: true,
+          result: { file_path: "/container-data/cold/long.bin" },
+        }));
+      }
+      return null;
+    },
+    cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
+  });
+
+  const downstream = http.get(`${harness.proxyRoot}/bot${token}/getFile?file_id=long-local-only`);
+  downstream.on("error", () => {});
+  await getFileReceived;
+  downstream.destroy();
+
+  await Promise.race([
+    upstreamAborted,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("native getFile upstream request was not cancelled")),
+      200,
+    )),
+  ]);
 });
 
 test("blocked getFile fallback preserves local authentication responses", async (t) => {

@@ -885,7 +885,9 @@ const server = http.createServer(async (req, res) => {
         reservation.release();
       }
     } else if (canBufferRequest(req, bufferLimitBytes)) {
-      await handleBuffered(req, res, method, token, startedAt);
+      await handleBuffered(req, res, method, token, startedAt, {
+        signal: clientController.signal,
+      });
     } else {
       await handleStreaming(req, res, method, token, startedAt);
     }
