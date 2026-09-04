@@ -124,6 +124,9 @@ test("named safe methods and default non-file methods preserve reasons", () => {
     "editMessageCaption",
     "editMessageReplyMarkup",
     "deleteMessage",
+    "setMessageReaction",
+    "deleteMessageReaction",
+    "deleteAllMessageReactions",
     "answerCallbackQuery",
     "sendChatAction",
     "setMyCommands",
@@ -215,6 +218,21 @@ test("local status retry rules stay method- and status-specific", () => {
   );
   assert.equal(
     policy.shouldRetryCloudAfterLocalStatus("getFile", 500),
+    false,
+  );
+  for (const method of [
+    "setMessageReaction",
+    "deleteMessageReaction",
+    "deleteAllMessageReactions",
+  ]) {
+    assert.equal(
+      policy.isSafeMethodForStatusFallback(method),
+      true,
+      method,
+    );
+  }
+  assert.equal(
+    policy.isSafeMethodForStatusFallback("sendDocument"),
     false,
   );
 });

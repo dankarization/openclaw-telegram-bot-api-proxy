@@ -114,6 +114,12 @@ class LegacyUpdateBridge {
   }
 
   #updateDateMs(update) {
+    const reactionUpdate = update?.message_reaction
+      ?? update?.message_reaction_count;
+    if (reactionUpdate != null) {
+      const reactionSeconds = exactSafeNonNegativeInteger(reactionUpdate?.date);
+      return reactionSeconds == null ? null : reactionSeconds * 1000;
+    }
     const seconds = numericOffset(
       update?.message?.date
         ?? update?.edited_message?.edit_date
@@ -127,10 +133,13 @@ class LegacyUpdateBridge {
     return seconds == null ? null : seconds * 1000;
   }
 
-  // Без timestamp legacy path считает cloud update допустимым.
+  // Undated legacy updates remain eligible; reaction updates require a valid date.
   #isFreshCloudUpdate(update) {
     const dateMs = this.#updateDateMs(update);
-    if (dateMs == null) return true;
+    if (dateMs == null) {
+      return update?.message_reaction == null
+        && update?.message_reaction_count == null;
+    }
     return this.#now() - dateMs <= this.#config.cloudFreshUpdateMaxAgeMs;
   }
 

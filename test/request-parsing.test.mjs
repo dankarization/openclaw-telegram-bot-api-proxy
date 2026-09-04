@@ -49,6 +49,9 @@ test("Telegram path helpers preserve token, method, and decoded file path behavi
   assert.equal(methodFromPath("/bot123:secret/GETUPDATES"), "getUpdates");
   assert.equal(methodFromPath("/bot123:secret/gEtFiLe"), "getFile");
   assert.equal(methodFromPath("/bot123:secret/SETWEBHOOK"), "setWebhook");
+  assert.equal(methodFromPath("/bot123:secret/SETMESSAGEREACTION"), "setMessageReaction");
+  assert.equal(methodFromPath("/bot123:secret/deletemessagereaction"), "deleteMessageReaction");
+  assert.equal(methodFromPath("/bot123:secret/DELETEALLMESSAGEREACTIONS"), "deleteAllMessageReactions");
   assert.equal(methodFromPath("/bot123:secret/test/getUpdates"), "getUpdates");
   assert.equal(methodFromPath("/bot123:secret/sendMessage?chat_id=1"), "sendMessage");
   assert.equal(methodFromPath("/file/bot123:secret/voice/a.ogg"), "file");
