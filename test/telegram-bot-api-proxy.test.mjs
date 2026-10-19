@@ -49,7 +49,7 @@ function parseUpstreamRequest(req) {
   return { kind: "unknown", pathname: url.pathname };
 }
 
-async function startUpstream(target, handler) {
+async function startUpstream(target, handler, options = {}) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
     const clientController = new AbortController();
@@ -59,6 +59,11 @@ async function startUpstream(target, handler) {
       ...parseUpstreamRequest(req),
       clientSignal: clientController.signal,
     };
+    if (options.captureBodies) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      request.body = Buffer.concat(chunks);
+    }
     requests.push(request);
     let response;
     try {
@@ -151,8 +156,9 @@ async function runProxyWithInvalidSeed(seed) {
 }
 
 async function startHarness(t, options) {
-  const local = await startUpstream("local", options.local);
-  const cloud = await startUpstream("cloud", options.cloud);
+  const upstreamOptions = { captureBodies: options.captureBodies === true };
+  const local = await startUpstream("local", options.local, upstreamOptions);
+  const cloud = await startUpstream("cloud", options.cloud, upstreamOptions);
   const port = await reservePort();
   const output = { value: "" };
   const child = spawn(process.execPath, [PROXY_ENTRYPOINT.pathname], {
@@ -251,6 +257,15 @@ async function rawGetUpdates(proxyRoot, token, offset) {
   return { status: response.status, payload };
 }
 
+async function rawBotApiRequest(proxyRoot, token, method, payload) {
+  const response = await fetch(`${proxyRoot}/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return { status: response.status, payload: await response.json() };
+}
+
 function healthyGetMe(request, healthy = true) {
   if (request.kind === "api" && request.method === "getMe") {
     return healthy
@@ -259,6 +274,91 @@ function healthyGetMe(request, healthy = true) {
   }
   return null;
 }
+
+test("setMessageReaction passes through local with its JSON body unchanged", async (t) => {
+  const token = "700001:reaction-local-secret-1234567890";
+  const payload = {
+    chat_id: 123,
+    message_id: 456,
+    reaction: [{ type: "emoji", emoji: "👍" }],
+    is_big: true,
+  };
+  const harness = await startHarness(t, {
+    captureBodies: true,
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.method === "setMessageReaction") {
+        return json(200, { ok: true, result: true });
+      }
+      return null;
+    },
+    cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
+  });
+
+  assert.deepEqual(
+    await rawBotApiRequest(harness.proxyRoot, token, "setMessageReaction", payload),
+    { status: 200, payload: { ok: true, result: true } },
+  );
+  const localReaction = harness.local.requests.find(
+    (request) => request.method === "setMessageReaction",
+  );
+  assert.deepEqual(JSON.parse(localReaction.body.toString("utf8")), payload);
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "setMessageReaction").length,
+    0,
+  );
+});
+
+test("reaction methods rescue local 5xx through cloud without widening unsafe status fallback", async (t) => {
+  const token = "700002:reaction-fallback-secret-1234567890";
+  const payloads = new Map([
+    ["setMessageReaction", {
+      chat_id: 123,
+      message_id: 456,
+      reaction: [{ type: "emoji", emoji: "🔥" }],
+    }],
+    ["deleteMessageReaction", { chat_id: 123, message_id: 456, user_id: 789 }],
+    ["deleteAllMessageReactions", { chat_id: 123, message_id: 456 }],
+  ]);
+  const harness = await startHarness(t, {
+    captureBodies: true,
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (payloads.has(request.method) || request.method === "sendDocument") {
+        return json(503, { ok: false, description: "local unavailable" });
+      }
+      return null;
+    },
+    cloud: (request) => {
+      if (payloads.has(request.method)) return json(200, { ok: true, result: true });
+      return json(500, { ok: false, description: "unexpected cloud request" });
+    },
+  });
+
+  for (const [method, payload] of payloads) {
+    assert.deepEqual(
+      await rawBotApiRequest(harness.proxyRoot, token, method, payload),
+      { status: 200, payload: { ok: true, result: true } },
+      method,
+    );
+    const localRequest = harness.local.requests.find((request) => request.method === method);
+    const cloudRequest = harness.cloud.requests.find((request) => request.method === method);
+    assert.deepEqual(JSON.parse(localRequest.body.toString("utf8")), payload, `${method} local body`);
+    assert.deepEqual(JSON.parse(cloudRequest.body.toString("utf8")), payload, `${method} cloud body`);
+  }
+
+  const unsafePayload = { chat_id: 123, document: "file-id" };
+  assert.deepEqual(
+    await rawBotApiRequest(harness.proxyRoot, token, "sendDocument", unsafePayload),
+    { status: 503, payload: { ok: false, description: "local unavailable" } },
+  );
+  assert.equal(
+    harness.cloud.requests.filter((request) => request.method === "sendDocument").length,
+    0,
+  );
+});
 
 test("getFile still tries local when the 2-second health check aborts", async (t) => {
   const token = "710101:health-timeout-secret-1234567890";
@@ -1181,6 +1281,84 @@ test("opt-in rescue keeps a current edit and callback for an old message", async
   });
 
   assert.deepEqual((await getUpdates(harness.proxyRoot, token, 1000)).map((update) => update.update_id), [1000, 1001]);
+});
+
+test("opt-in rescue preserves allowed_updates and filters reaction updates by their own date", async (t) => {
+  const token = "100101:reaction-updates-secret-value-1234567890";
+  const now = Math.floor(Date.now() / 1000);
+  const freshReaction = {
+    update_id: 12,
+    message_reaction: {
+      chat: { id: 123, type: "private" },
+      message_id: 456,
+      date: now,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "👍" }],
+      user: { id: 789, is_bot: false, first_name: "Reviewer" },
+    },
+  };
+  const requestPayload = {
+    offset: 1000,
+    timeout: 0,
+    allowed_updates: ["message_reaction", "message_reaction_count"],
+  };
+  const harness = await startHarness(t, {
+    captureBodies: true,
+    env: {
+      ENABLE_CLOUD_GETUPDATES_FALLBACK: "1",
+      ENABLE_CLOUD_GETUPDATES_ON_LOCAL_EMPTY: "1",
+      CLOUD_PENDING_FALLBACK_DELAY_MS: "0",
+    },
+    local: (request) => {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      if (request.method === "getUpdates") return json(200, { ok: true, result: [] });
+      return null;
+    },
+    cloud: (request) => {
+      if (request.method === "getWebhookInfo") {
+        return json(200, { ok: true, result: { pending_update_count: 3 } });
+      }
+      if (request.method === "getUpdates") {
+        return json(200, {
+          ok: true,
+          result: [
+            {
+              update_id: 10,
+              message_reaction: { ...freshReaction.message_reaction, date: now - (7 * 60 * 60) },
+            },
+            {
+              update_id: 11,
+              message_reaction_count: {
+                chat: { id: -100123, type: "channel" },
+                message_id: 455,
+                reactions: [],
+              },
+            },
+            freshReaction,
+          ],
+        });
+      }
+      return healthyGetMe(request);
+    },
+  });
+
+  const rescued = await rawBotApiRequest(
+    harness.proxyRoot,
+    token,
+    "getUpdates",
+    requestPayload,
+  );
+  assert.equal(rescued.status, 200);
+  assert.deepEqual(rescued.payload.result, [{ ...freshReaction, update_id: 1000 }]);
+
+  const localPoll = harness.local.requests.find((request) => request.method === "getUpdates");
+  const cloudPoll = harness.cloud.requests.find((request) => request.method === "getUpdates");
+  assert.deepEqual(JSON.parse(localPoll.body.toString("utf8")), requestPayload);
+  assert.deepEqual(JSON.parse(cloudPoll.body.toString("utf8")), {
+    ...requestPayload,
+    offset: 0,
+  });
 });
 
 test("getUpdates 401 and 404 stay local and never fall back to cloud", async (t) => {

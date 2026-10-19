@@ -276,6 +276,54 @@ test("cloud rescue filters stale messages while keeping current edits and undate
   assert.equal(translatedRequest.blocked, false);
 });
 
+test("cloud rescue preserves fresh reaction updates and rejects stale or malformed reaction dates", () => {
+  const { instance } = bridge();
+  const freshReaction = {
+    update_id: 20,
+    message_reaction: {
+      chat: { id: 123, type: "private" },
+      message_id: 45,
+      date: NOW_SECONDS,
+      old_reaction: [],
+      new_reaction: [{ type: "emoji", emoji: "👍" }],
+      user: { id: 456, is_bot: false, first_name: "Reviewer" },
+    },
+  };
+  const guarded = instance.guardedCloudGetUpdates(
+    request(1000),
+    "getUpdates",
+    "123:secret",
+    Buffer.alloc(0),
+    response([
+      {
+        update_id: 18,
+        message_reaction: { ...freshReaction.message_reaction, date: NOW_SECONDS - (7 * 60 * 60) },
+      },
+      {
+        update_id: 19,
+        message_reaction_count: {
+          chat: { id: -100123, type: "channel" },
+          message_id: 44,
+          date: "invalid",
+          reactions: [],
+        },
+      },
+      freshReaction,
+    ]),
+    { virtualizeLowerIds: true },
+  );
+
+  assert.equal(guarded.dropped, 2);
+  assert.deepEqual(resultBody(guarded), [{ ...freshReaction, update_id: 1000 }]);
+  assert.deepEqual(instance.redactedStateSnapshot().cloudUpdateStateByBotId, {
+    123: {
+      cloudFloor: 20,
+      virtualFloor: 1000,
+      filterStaleUpdates: true,
+    },
+  });
+});
+
 test("an all-stale cloud rescue returns empty and records the terminal native floor", () => {
   const { instance, logs } = bridge();
   const stale = NOW_SECONDS - (7 * 60 * 60);
