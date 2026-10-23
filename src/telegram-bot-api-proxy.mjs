@@ -4,6 +4,7 @@ import { URL } from "node:url";
 
 import { createFallbackPolicy } from "./fallback-policy.mjs";
 import { createFileRouter } from "./file-routing.mjs";
+import { LocalFileDownloads } from "./local-file-downloads.mjs";
 import { PerBotPollCoordinator } from "./per-bot-poll-coordinator.mjs";
 import {
   applyGetUpdatesTimeoutCap,
@@ -202,7 +203,16 @@ function guardedLocalGetUpdates(req, method, token, body, upstream) {
   return result;
 }
 
-const processGetFileResult = fileRouter.processGetFileResult.bind(fileRouter);
+const localFileDownloads = new LocalFileDownloads({
+  root: localFilePathRewriteTo,
+  ttlMs: fileInfoCacheTtlMs,
+  now: runtimeHooks.now,
+});
+function processGetFileResult(method, token, upstream, target) {
+  const processed = fileRouter.processGetFileResult(method, token, upstream, target);
+  if (method === "getFile" && target === "local") localFileDownloads.observe(token, processed);
+  return processed;
+}
 const cloudFallbackPolicy = fallbackPolicy.cloudFallbackPolicy.bind(fallbackPolicy);
 const canUseCloudFallback = fallbackPolicy.canUseCloudFallback.bind(fallbackPolicy);
 const isSafeMethodForStatusFallback = fallbackPolicy.isSafeMethodForStatusFallback.bind(fallbackPolicy);
@@ -782,8 +792,25 @@ async function handleBuffered(req, res, method, token, startedAt, options = {}) 
   }
 }
 
-async function handleStreaming(req, res, method, token, startedAt) {
+async function handleStreaming(req, res, method, token, startedAt, options = {}) {
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
+  // Parse the original route once, before URL dot-segment normalization.
+  const rawFileMatch = (req.url || "").split("?", 1)[0].match(/^\/file\/bot[^/]+\/(.*)$/u);
+  const localPath = rawFileMatch ? decodeURIComponent(rawFileMatch[1]) : "";
+  if (method === "file" && localPath.startsWith("/")) {
+    beginStreaming("download");
+    try {
+      const result = await localFileDownloads.serve(req, res, token, localPath, {
+        signal: options.signal,
+        timeoutMs: localGetFileDownloadTimeoutMs,
+        idleTimeoutMs: upstreamTimeoutMs,
+      });
+      log(`method=file target=local-file stream=download status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
+    } finally {
+      endStreaming("download");
+    }
+    return;
+  }
   const cloudFallback = cloudFallbackPolicy(method, token, pathname, req);
   const cloudFallbackAllowed = cloudFallback.allowed;
   const affinityTarget = method === "file" && cloudFallback.source === "local"
@@ -791,7 +818,7 @@ async function handleStreaming(req, res, method, token, startedAt) {
     : method === "file" && cloudFallback.source === "cloud" && cloudFallbackAllowed
       ? "cloud"
       : null;
-  const localIsHealthy = affinityTarget ? null : await checkLocalHealth(token);
+  const localIsHealthy = affinityTarget ? null : await checkLocalHealth(token, options.signal);
   const initialTarget = affinityTarget || (localIsHealthy || !cloudFallbackAllowed ? "local" : "cloud");
   const initialRoot = initialTarget === "local" ? localRoot : cloudRoot;
   const streamKind = streamingKind(req, method);
@@ -800,14 +827,16 @@ async function handleStreaming(req, res, method, token, startedAt) {
     const result = await forwardStreaming(req, res, initialRoot, {
       method,
       target: initialTarget,
+      signal: options.signal,
     });
     log(`method=${method} target=${initialTarget}${affinityTarget ? " reason=file-source-affinity" : ""} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
   } catch (error) {
-    if (cloudFallbackAllowed && initialTarget === "local" && isClearlyLocalUnavailable(error) && (req.method === "GET" || req.method === "HEAD")) {
+    if (!options.signal?.aborted && !res.headersSent && cloudFallbackAllowed && initialTarget === "local" && isClearlyLocalUnavailable(error) && (req.method === "GET" || req.method === "HEAD")) {
       markLocalUnhealthy(errorReason(error));
       const result = await forwardStreaming(req, res, cloudRoot, {
         method,
         target: "cloud",
+        signal: options.signal,
       });
       log(`method=${method} target=cloud ${errorLogFields(error)} stream=${streamKind} status=${result.statusCode} ${streamingCounterFields()} ms=${Date.now() - startedAt}`);
       return;
@@ -889,7 +918,9 @@ const server = http.createServer(async (req, res) => {
         signal: clientController.signal,
       });
     } else {
-      await handleStreaming(req, res, method, token, startedAt);
+      await handleStreaming(req, res, method, token, startedAt, {
+        signal: clientController.signal,
+      });
     }
   } catch (error) {
     const queueFull = error?.code === "POLL_QUEUE_FULL";

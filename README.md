@@ -72,7 +72,10 @@ flowchart LR
 3. Успешный local `file_path` переписывается из контейнерного префикса в путь
    host-mounted volume, доступный OpenClaw.
 4. Связь `file_path → upstream` хранится пять минут. Поэтому последующий
-   `/file/...` не скачает local-файл через cloud и наоборот.
+   `/file/...` не скачает local-файл через cloud и наоборот. Для абсолютного
+   host path proxy сам потоково отдаёт bytes из `LOCAL_FILE_PATH_REWRITE_TO`:
+   local Bot API в режиме `--local` не предоставляет этот HTTP file endpoint.
+   Ответ `getFile` для OpenClaw, читающего host path напрямую, не меняется.
 5. Cloud-download разрешён только для cloud-sourced файла с известным размером
    не выше `CLOUD_FILE_FALLBACK_MAX_BYTES` (по умолчанию 20 MiB).
 
@@ -91,6 +94,33 @@ proxy. Пример для 4 GiB и двухчасового окна proxy с �
   }
 }
 ```
+
+## Remote file consumer
+
+Remote consumer использует тот же proxy: `getFile`, затем
+`GET /file/bot<TOKEN>/<file_path>` (сегменты path percent-encoded один раз;
+начальный `/` absolute path сохраняется). `HEAD` возвращает только размер.
+Это source-контракт; наличие candidate не означает production activation.
+
+- HTTP bytes разрешены только после успешного local `getFile` с тем же **полным
+  token** и точным rewritten path. В памяти хранятся SHA-256 ключи, не credentials.
+- Grants действуют `FILE_INFO_CACHE_TTL_MS`, максимум 10 000 на процесс;
+  restart/expiry/eviction требуют нового `getFile`. Host-local чтение не меняется.
+- Единственный readable root — уже настроенный `LOCAL_FILE_PATH_REWRITE_TO`.
+  Пустой root, `/`, root без доступа при старте, traversal и symlink escape
+  закрыты. Нужны Linux `/proc/self/fd`, Node >=22 и права чтения этого volume.
+- Размер из metadata, если указан, должен совпасть с `fstat`; optional размер
+  при отсутствии берётся из файла. Выдаются только regular files, без Range,
+  redirect, disk spool и целого файла в памяти. Early EOF обрывает HTTP response.
+- Local failures возвращают 404 без раскрытия path и без обращения в cloud;
+  неподдержанный метод — 405. In-flight abort/deadline освобождает fd/counters.
+  Полное окно — `LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS`, idle — `UPSTREAM_TIMEOUT_MS`.
+- Relative/cloud paths сохраняют прежние affinity и ограниченный fallback.
+
+Не выставляйте raw token-bearing API в публичный ingress/logs. Существующий
+приватный route должен передавать исходный URI без нормализации absolute/encoded
+path; TLS/ACL, отключение request/access/error URI logging и buffering — задача
+оператора existing ingress, не нового сервиса. Подробности: [architecture](docs/architecture.md).
 
 ## Требования
 

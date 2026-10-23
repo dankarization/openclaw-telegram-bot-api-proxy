@@ -176,7 +176,19 @@ OpenClaw может прочитать такой путь напрямую. Е�
 
 ### `/file/...`
 
-- local affinity всегда остаётся local;
+- абсолютный rewritten local path обслуживается **самим proxy** из root
+  `LOCAL_FILE_PATH_REWRITE_TO`, а не пересылается local Bot API;
+- grant выдаёт только успешный local `getFile`: ключ — SHA-256 полного token +
+  точного path, TTL — `FILE_INFO_CACHE_TTL_MS`, максимум 10 000 grants;
+- canonical root фиксируется при старте, root/path проверяются до открытия,
+  затем проверяется реальный `/proc/self/fd` открытого regular file; symlink
+  escape, FIFO, directory и size mismatch закрываются до response headers;
+- backpressure ограничивает чтение; abort, полный deadline и idle timeout
+  освобождают stream/fd/counters. Truncation после headers обрывает response;
+- local-file failure — 404 без fallback; GET/HEAD only, другие методы — 405.
+  Expiry/restart/eviction требуют нового `getFile`. Optional `file_size`
+  заменяется размером `fstat`, malformed metadata не выдаёт grant;
+- относительный local path сохраняет старую upstream-affinity, без чтения FS;
 - cloud affinity допускается только при известном размере до cloud-лимита;
 - неизвестный source/size закрывается local-only;
 - после истечения TTL route заново требует подтверждённую metadata.
@@ -210,7 +222,7 @@ Process-local state включает:
 
 - local/cloud cursor bridge;
 - cloud pending-probe cache;
-- media source/size caches;
+- media source/size caches и bounded token-digest local-file grants;
 - FIFO lanes и active streaming counters;
 - recent internal ACK suppression.
 

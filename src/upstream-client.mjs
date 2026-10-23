@@ -205,6 +205,10 @@ export function createUpstreamClient(options = {}) {
           },
           timeout: requestOptions.timeoutMs ?? upstreamTimeoutMs,
         }, (upstreamRes) => {
+          upstreamRes.once("error", (error) => finish(reject, error));
+          upstreamRes.once("aborted", () => {
+            finish(reject, Object.assign(new Error("upstream response aborted"), { code: "ECONNRESET" }));
+          });
           res.writeHead(upstreamRes.statusCode || 502, copyHeaders(upstreamRes.headers));
           upstreamRes.pipe(res);
           upstreamRes.on("end", async () => {

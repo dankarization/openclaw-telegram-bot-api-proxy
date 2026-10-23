@@ -3,6 +3,10 @@ import { once } from "node:events";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, open, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 const PROXY_ENTRYPOINT = new URL("../src/telegram-bot-api-proxy.mjs", import.meta.url);
@@ -75,6 +79,7 @@ async function startUpstream(target, handler, options = {}) {
       res.destroy();
       return;
     }
+    if (response?.stream) return response.stream(req, res);
     if (response?.delayMs != null) {
       await new Promise((resolve) => setTimeout(resolve, response.delayMs));
       response = response.response;
@@ -219,6 +224,7 @@ async function startHarness(t, options) {
     local,
     cloud,
     output,
+    child,
     proxyRoot: `http://127.0.0.1:${port}`,
   };
 }
@@ -820,17 +826,21 @@ test("media metadata capture leaves seeded getUpdates offset virtualization unch
   assert.equal(updates[0].message.audio.file_id, "offset-audio");
 });
 
-test("local getFile keeps a rewritten local download on local", async (t) => {
+test("local getFile serves rewritten local bytes without an upstream file endpoint", async (t) => {
+  const root = await localCache(t);
+  await mkdir(path.join(root, "media"));
+  await writeFile(path.join(root, "media/local.ogg"), "local bytes");
   const token = "111111:local-secret-value-1234567890";
   let localHealthy = true;
   const harness = await startHarness(t, {
+    env: { LOCAL_FILE_PATH_REWRITE_TO: root },
     local: (request) => {
       const health = healthyGetMe(request, localHealthy);
       if (health) return health;
       if (request.kind === "api" && request.method === "getFile") {
         return json(200, {
           ok: true,
-          result: { file_path: "/container-data/media/local.ogg", file_size: 1024 },
+          result: { file_path: "/container-data/media/local.ogg", file_size: 11 },
         });
       }
       if (request.kind === "file") return text(200, `local:${request.filePath}`);
@@ -840,12 +850,13 @@ test("local getFile keeps a rewritten local download on local", async (t) => {
   });
 
   const file = await getFile(harness.proxyRoot, token, "local-file");
-  assert.equal(file.file_path, "/host-data/media/local.ogg");
+  assert.equal(file.file_path, `${root}/media/local.ogg`);
   localHealthy = false;
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   const download = await downloadFile(harness.proxyRoot, token, file.file_path);
-  assert.deepEqual(download, { status: 200, body: "local:/host-data/media/local.ogg" });
+  assert.deepEqual(download, { status: 200, body: "local bytes" });
+  assert.equal(harness.local.requests.filter((request) => request.kind === "file").length, 0);
   assert.equal(harness.cloud.requests.filter((request) => request.kind === "file").length, 0);
 });
 
@@ -892,6 +903,11 @@ test("confirmed-small local update may fall back from local 400 and keeps the do
 });
 
 test("a 147 MB update never reaches cloud getFile while boundary and local-large routing stay safe", async (t) => {
+  const root = await localCache(t);
+  await mkdir(path.join(root, "local"));
+  const large = await open(path.join(root, "local/large.bin"), "w");
+  await large.truncate(CLOUD_FILE_LIMIT + 1);
+  await large.close();
   const token = "333333:limit-secret-value-1234567890";
   const fileById = {
     boundary: { source: "cloud", file_path: "cloud/boundary.bin", file_size: CLOUD_FILE_LIMIT },
@@ -899,6 +915,7 @@ test("a 147 MB update never reaches cloud getFile while boundary and local-large
     localLarge: { source: "local", file_path: "/container-data/local/large.bin", file_size: CLOUD_FILE_LIMIT + 1 },
   };
   const harness = await startHarness(t, {
+    env: { LOCAL_FILE_PATH_REWRITE_TO: root },
     local: (request) => {
       const health = healthyGetMe(request);
       if (health) return health;
@@ -944,11 +961,13 @@ test("a 147 MB update never reaches cloud getFile while boundary and local-large
   assert.match(over.payload.description, /cloud fallback blocked \(file-too-large\)/u);
 
   const localLarge = await getFile(harness.proxyRoot, token, "localLarge");
-  assert.equal(localLarge.file_path, "/host-data/local/large.bin");
-  assert.deepEqual(await downloadFile(harness.proxyRoot, token, localLarge.file_path), {
-    status: 200,
-    body: "local:/host-data/local/large.bin",
-  });
+  assert.equal(localLarge.file_path, `${root}/local/large.bin`);
+  const localDownload = await fetch(fileUrl(harness, token, localLarge.file_path));
+  assert.equal(localDownload.status, 200);
+  let downloaded = 0;
+  for await (const chunk of localDownload.body) downloaded += chunk.length;
+  assert.equal(downloaded, CLOUD_FILE_LIMIT + 1);
+  assert.equal(harness.local.requests.filter((request) => request.kind === "file").length, 0);
 
   const cloudDownloads = harness.cloud.requests.filter((request) => request.kind === "file");
   assert.deepEqual(cloudDownloads.map((request) => request.filePath), ["cloud/boundary.bin"]);
@@ -1648,4 +1667,364 @@ test("cloud-local-cloud recovery advances the shared virtual cursor", async (t) 
   phase = "network";
   assert.deepEqual((await getUpdates(harness.proxyRoot, token, 1002)).map((update) => update.update_id), [1002]);
   assert.deepEqual(cloudOffsets, ["0", "11"]);
+});
+
+// Synthetic local Bot API responses over real HTTP, through the actual proxy
+// child and OS filesystem. No Telegram traffic, credentials or polling owner.
+async function localCache(t) {
+  const root = await mkdtemp(path.join(process.env.TMPDIR || tmpdir(), "proxy-local-media-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+function fileUrl(harness, token, filename) {
+  return `${harness.proxyRoot}/file/bot${token}/${encodeFilePath(filename)}`;
+}
+
+async function localFileHarness(t, root, files, env = {}) {
+  return startHarness(t, {
+    env: { LOCAL_FILE_PATH_REWRITE_TO: root, ...env },
+    local: (request) => {
+      if (request.method === "getFile") {
+        const file = files[request.fileId];
+        if (file) return json(200, { ok: true, result: file });
+        return json(400, { ok: false });
+      }
+      // Deliberately no /file endpoint (the real local Bot API lacks it).
+      return healthyGetMe(request);
+    },
+    cloud: () => json(500, { ok: false, description: "cloud must not be called" }),
+  });
+}
+
+const remoteToken = "123456:synthetic-remote-media-secret-only";
+
+test("remote local getFile to HTTP bytes exceeds 20 MiB with exact length/hash, HEAD and no upstream download", async (t) => {
+  const root = await localCache(t);
+  const filename = path.join(root, "media space-ю.bin");
+  const size = 24 * 1024 * 1024 + 123;
+  const chunk = Buffer.alloc(1024 * 1024);
+  for (let i = 0; i < chunk.length; i++) chunk[i] = (i * 31 + 17) % 251;
+  const expectedHash = createHash("sha256");
+  const handle = await open(filename, "w");
+  try {
+    for (let offset = 0; offset < size; offset += chunk.length) {
+      const part = chunk.subarray(0, Math.min(chunk.length, size - offset));
+      await handle.writeFile(part);
+      expectedHash.update(part);
+    }
+  } finally { await handle.close(); }
+  const harness = await localFileHarness(t, root, {
+    large: { file_path: "/container-data/media space-ю.bin", file_size: size },
+  });
+  const file = await getFile(harness.proxyRoot, remoteToken, "large");
+  assert.equal(file.file_path, filename); // unchanged host-local response
+  const head = await fetch(fileUrl(harness, remoteToken, file.file_path), { method: "HEAD" });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get("content-length"), String(size));
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+  const response = await fetch(fileUrl(harness, remoteToken, file.file_path));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-length"), String(size));
+  assert.equal(response.headers.get("cache-control"), "private, no-store");
+  let received = 0;
+  const hash = createHash("sha256");
+  for await (const part of response.body) { received += part.length; hash.update(part); }
+  assert.equal(received, size);
+  assert.equal(hash.digest("hex"), expectedHash.digest("hex"));
+  assert.equal(harness.local.requests.filter((r) => r.kind === "file").length, 0);
+  assert.equal(harness.cloud.requests.length, 0);
+  await waitForOutput(harness.output, "target=local-file");
+  assert(!harness.output.value.includes(remoteToken));
+  assert(!harness.output.value.includes(filename));
+  t.diagnostic(`synthetic real HTTP bytes=${received}, SHA-256 matched; no Telegram requests`);
+});
+
+test("local byte grants reject missing, invalid, unrelated, other-bot and guessed same-bot tokens without fallback", async (t) => {
+  const root = await localCache(t);
+  await writeFile(path.join(root, "good.bin"), "good");
+  await writeFile(path.join(root, "unrelated.bin"), "private");
+  const harness = await localFileHarness(t, root, {
+    good: { file_path: "/container-data/good.bin", file_size: 4 },
+    missing: { file_path: "/container-data/missing.bin", file_size: 4 },
+    outside: { file_path: `${root}-other/secret.bin`, file_size: 4 },
+    invalid: { file_path: "/container-data/../secret.bin", file_size: 4 },
+    unknownSize: { file_path: "/container-data/good.bin" },
+    malformedSize: { file_path: "/container-data/good.bin", file_size: "4bad" },
+  });
+  const goodPath = path.join(root, "good.bin");
+  assert.equal((await fetch(fileUrl(harness, remoteToken, goodPath))).status, 404);
+  for (const id of ["missing", "outside", "invalid", "malformedSize"]) {
+    const file = await getFile(harness.proxyRoot, remoteToken, id);
+    const response = await fetch(fileUrl(harness, remoteToken, file.file_path));
+    assert.equal(response.status, 404, id);
+    assert(!(await response.text()).includes(root));
+  }
+  await getFile(harness.proxyRoot, remoteToken, "unknownSize");
+  assert.equal((await fetch(fileUrl(harness, remoteToken, goodPath))).status, 200);
+  await getFile(harness.proxyRoot, remoteToken, "good");
+  for (const token of ["654321:another-bot-secret", "123456:guessed-secret-same-bot"]) {
+    assert.equal((await fetch(fileUrl(harness, token, goodPath))).status, 404);
+  }
+  assert.equal((await fetch(fileUrl(harness, remoteToken, path.join(root, "unrelated.bin")))).status, 404);
+  assert.equal((await fetch(fileUrl(harness, remoteToken, goodPath), { method: "POST" })).status, 405);
+  assert.equal((await fetch(fileUrl(harness, remoteToken, goodPath))).status, 200);
+  assert.equal(harness.cloud.requests.length, 0);
+  assert.equal(harness.local.requests.filter((r) => r.kind === "file").length, 0);
+  assert(!harness.output.value.includes(remoteToken));
+});
+
+test("local byte serving rejects symlink escape, directory, FIFO and changed size even after getFile", async (t) => {
+  const root = await localCache(t);
+  const outside = await localCache(t);
+  await writeFile(path.join(outside, "secret.bin"), "outside");
+  await symlink(path.join(outside, "secret.bin"), path.join(root, "escape.bin"));
+  await symlink(outside, path.join(root, "ancestor"));
+  await writeFile(path.join(root, "another-bot.bin"), "private");
+  await symlink(path.join(root, "another-bot.bin"), path.join(root, "inside-link.bin"));
+  await mkdir(path.join(root, "directory"));
+  await writeFile(path.join(root, "changed.bin"), "short");
+  const fifo = spawn("mkfifo", [path.join(root, "fifo")]);
+  assert.equal((await once(fifo, "exit"))[0], 0);
+  const files = {
+    escape: { file_path: "/container-data/escape.bin", file_size: 7 },
+    ancestor: { file_path: "/container-data/ancestor/secret.bin", file_size: 7 },
+    inside: { file_path: "/container-data/inside-link.bin", file_size: 7 },
+    directory: { file_path: "/container-data/directory", file_size: 4096 },
+    fifo: { file_path: "/container-data/fifo", file_size: 0 },
+    changed: { file_path: "/container-data/changed.bin", file_size: 6 },
+  };
+  const harness = await localFileHarness(t, root, files);
+  for (const id of Object.keys(files)) {
+    const file = await getFile(harness.proxyRoot, remoteToken, id);
+    const res = await fetch(fileUrl(harness, remoteToken, file.file_path), { signal: AbortSignal.timeout(2000) });
+    assert.equal(res.status, 404, id);
+    await res.text();
+  }
+  assert.equal(harness.cloud.requests.length, 0);
+});
+
+test("local grant expires and fresh getFile renews it; zero-byte files are supported", async (t) => {
+  const root = await localCache(t);
+  await writeFile(path.join(root, "empty.bin"), "");
+  const harness = await localFileHarness(t, root, {
+    empty: { file_path: "/container-data/empty.bin", file_size: 0 },
+  }, { FILE_INFO_CACHE_TTL_MS: "100" });
+  const file = await getFile(harness.proxyRoot, remoteToken, "empty");
+  assert.equal((await fetch(fileUrl(harness, remoteToken, file.file_path))).status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal((await fetch(fileUrl(harness, remoteToken, file.file_path))).status, 404);
+  await getFile(harness.proxyRoot, remoteToken, "empty");
+  assert.equal((await fetch(fileUrl(harness, remoteToken, file.file_path))).status, 200);
+  assert.equal(harness.cloud.requests.length, 0);
+});
+
+async function openFileDescriptors(pid, filename) {
+  const names = await readdir(`/proc/${pid}/fd`);
+  const links = await Promise.all(names.map((name) => readlink(`/proc/${pid}/fd/${name}`).catch(() => "")));
+  return links.filter((link) => link === filename).length;
+}
+
+async function waitForNoFileDescriptor(pid, filename) {
+  const deadline = Date.now() + 2000;
+  while (await openFileDescriptors(pid, filename)) {
+    if (Date.now() > deadline) throw new Error("local download descriptor leaked after cancellation");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test("slow remote download backpressures and repeated cancellation releases descriptor/counters without fallback", async (t) => {
+  const root = await localCache(t);
+  const filename = path.join(root, "slow.bin");
+  const handle = await open(filename, "w");
+  await handle.truncate(128 * 1024 * 1024); // sparse, not a new build/cache environment
+  await handle.close();
+  const harness = await localFileHarness(t, root, {
+    slow: { file_path: "/container-data/slow.bin", file_size: 128 * 1024 * 1024 },
+  });
+  await getFile(harness.proxyRoot, remoteToken, "slow");
+  const rss = async () => Number((await readFile(`/proc/${harness.child.pid}/status`, "utf8")).match(/^VmRSS:\s+(\d+)/m)[1]) * 1024;
+  const before = await rss();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const req = http.get(fileUrl(harness, remoteToken, filename));
+    req.on("error", () => {});
+    const [res] = await once(req, "response");
+    res.on("error", () => {});
+    res.pause();
+    assert.equal(res.statusCode, 200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await openFileDescriptors(harness.child.pid, filename), 1, "stream should remain backpressured, not buffer entire file");
+    assert((await rss()) - before < 40 * 1024 * 1024, "bounded streaming RSS");
+    req.destroy();
+    res.destroy();
+    await waitForNoFileDescriptor(harness.child.pid, filename);
+  }
+  // A completed probe must see one active stream, not accumulated cancellations.
+  const probe = await fetch(fileUrl(harness, remoteToken, filename), { method: "HEAD" });
+  assert.equal(probe.status, 200);
+  await waitForOutput(harness.output, "target=local-file stream=download status=200 activeStreaming=1");
+  assert(!/target=local-file.*activeStreaming=[2-9]/u.test(harness.output.value));
+  assert.equal(harness.cloud.requests.length, 0);
+  assert(!harness.output.value.includes(remoteToken));
+});
+
+test("local transfer truncated after headers fails closed and releases the file", async (t) => {
+  const root = await localCache(t);
+  const filename = path.join(root, "truncated.bin");
+  const handle = await open(filename, "w");
+  await handle.truncate(128 * 1024 * 1024);
+  await handle.close();
+  const harness = await localFileHarness(t, root, {
+    truncated: { file_path: "/container-data/truncated.bin", file_size: 128 * 1024 * 1024 },
+  });
+  await getFile(harness.proxyRoot, remoteToken, "truncated");
+  const req = http.get(fileUrl(harness, remoteToken, filename));
+  req.on("error", () => {});
+  const [res] = await once(req, "response");
+  res.on("error", () => {});
+  res.pause();
+  const writer = await open(filename, "w");
+  await writer.close();
+  const completed = new Promise((resolve, reject) => {
+    res.on("end", () => reject(new Error("truncated transfer must not complete")));
+    res.on("aborted", resolve);
+  });
+  res.resume();
+  await Promise.race([
+    completed,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("truncation did not abort HTTP response")), 2000).unref()),
+  ]);
+  await waitForNoFileDescriptor(harness.child.pid, filename);
+  assert.equal(harness.cloud.requests.length, 0);
+});
+
+test("raw encoded traversal/malformed paths cannot reuse a local grant; absent or filesystem-root config stays closed", async (t) => {
+  const root = await localCache(t);
+  await writeFile(path.join(root, "good.bin"), "good");
+  const files = { good: { file_path: "/container-data/good.bin", file_size: 4 } };
+  const harness = await localFileHarness(t, root, files);
+  await getFile(harness.proxyRoot, remoteToken, "good");
+  async function rawStatus(rawPath) {
+    const url = new URL(harness.proxyRoot);
+    const req = http.get({ hostname: url.hostname, port: url.port, path: rawPath });
+    const [res] = await once(req, "response");
+    res.resume();
+    await once(res, "end");
+    return res.statusCode;
+  }
+  const prefix = `/file/bot${remoteToken}/`;
+  assert.equal(await rawStatus(`${prefix}${encodeURIComponent(root)}/nested/%2e%2e/good.bin`), 404);
+  assert.equal(await rawStatus(`${prefix}${encodeURIComponent(root)}/%00good.bin`), 404);
+  assert.equal(await rawStatus(`${prefix}%zz`), 400);
+  assert.equal(await rawStatus(`${prefix}${encodeURIComponent(root)}%252Fgood.bin`), 404);
+  assert.equal(harness.cloud.requests.length, 0);
+  for (const config of ["", "/"]) {
+    const closed = await localFileHarness(t, root, files, { LOCAL_FILE_PATH_REWRITE_TO: config });
+    const file = await getFile(closed.proxyRoot, remoteToken, "good");
+    assert.equal((await fetch(fileUrl(closed, remoteToken, file.file_path))).status, 404);
+    assert.equal(closed.cloud.requests.length, 0);
+  }
+});
+
+test("local-file deadline aborts a backpressured client and frees its descriptor", async (t) => {
+  const root = await localCache(t);
+  const filename = path.join(root, "deadline.bin");
+  const handle = await open(filename, "w");
+  await handle.truncate(128 * 1024 * 1024);
+  await handle.close();
+  const harness = await localFileHarness(t, root, {
+    deadline: { file_path: "/container-data/deadline.bin", file_size: 128 * 1024 * 1024 },
+  }, { LOCAL_GETFILE_DOWNLOAD_TIMEOUT_MS: "300" });
+  await getFile(harness.proxyRoot, remoteToken, "deadline");
+  const req = http.get(fileUrl(harness, remoteToken, filename));
+  req.on("error", () => {});
+  const [res] = await once(req, "response");
+  res.on("error", () => {});
+  res.pause();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await waitForNoFileDescriptor(harness.child.pid, filename);
+  req.destroy();
+  res.destroy();
+  assert.equal(harness.cloud.requests.length, 0);
+});
+
+test("changing a configured root symlink cannot retarget a live local-file grant", async (t) => {
+  const fixture = await localCache(t);
+  const approved = path.join(fixture, "approved");
+  const outside = path.join(fixture, "outside");
+  const root = path.join(fixture, "root");
+  await mkdir(approved);
+  await mkdir(outside);
+  await writeFile(path.join(approved, "same.bin"), "safe");
+  await writeFile(path.join(outside, "same.bin"), "leak");
+  await symlink(approved, root);
+  const harness = await localFileHarness(t, root, {
+    file: { file_path: "/container-data/same.bin", file_size: 4 },
+  });
+  const file = await getFile(harness.proxyRoot, remoteToken, "file");
+  assert.equal((await fetch(fileUrl(harness, remoteToken, file.file_path))).status, 200);
+  await rm(root);
+  await symlink(outside, root);
+  assert.equal((await fetch(fileUrl(harness, remoteToken, file.file_path))).status, 404);
+  assert.equal(harness.cloud.requests.length, 0);
+});
+
+test("cloud-affinity download cancellation reaches the upstream stream without retry", async (t) => {
+  let upstreamClosed;
+  const closed = new Promise((resolve) => { upstreamClosed = resolve; });
+  const harness = await startHarness(t, {
+    local: (request) => {
+      if (request.method === "getFile") return json(400, { ok: false });
+      if (request.method === "getUpdates") return json(200, {
+        ok: true, result: [{ update_id: 1, message: { document: { file_id: "small-cloud", file_size: 1024 } } }],
+      });
+      return healthyGetMe(request);
+    },
+    cloud: (request) => {
+      if (request.method === "getFile") return json(200, { ok: true, result: { file_path: "cloud/small.bin", file_size: 1024 } });
+      if (request.kind === "file") return { stream(req, res) {
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        const chunk = Buffer.alloc(65536);
+        const pump = () => { while (!res.destroyed && res.write(chunk)) {} };
+        res.on("drain", pump);
+        res.once("close", upstreamClosed);
+        pump();
+      } };
+      return healthyGetMe(request);
+    },
+  });
+  await getUpdates(harness.proxyRoot, remoteToken, 0);
+  const file = await getFile(harness.proxyRoot, remoteToken, "small-cloud");
+  const req = http.get(fileUrl(harness, remoteToken, file.file_path));
+  req.on("error", () => {});
+  const [res] = await once(req, "response");
+  res.on("error", () => {});
+  res.pause();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  req.destroy();
+  res.destroy();
+  await Promise.race([closed, new Promise((_, reject) => setTimeout(() => reject(new Error("upstream stream survived downstream cancellation")), 2000).unref())]);
+  assert.equal(harness.cloud.requests.filter((r) => r.kind === "file").length, 1);
+  assert.equal(harness.local.requests.filter((r) => r.kind === "file").length, 0);
+});
+
+test("upstream mid-body reset aborts the remote response without a crash or post-header fallback", async (t) => {
+  const harness = await startHarness(t, {
+    local: (request) => {
+      if (request.kind === "file") return { stream(req, res) {
+        res.writeHead(200, { "content-type": "application/octet-stream", "content-length": "1024" });
+        res.write("short");
+        setTimeout(() => res.destroy(), 30);
+      } };
+      return healthyGetMe(request);
+    },
+    cloud: () => json(500, { ok: false }),
+  });
+  const response = await fetch(fileUrl(harness, remoteToken, "relative/file.bin"));
+  assert.equal(response.status, 200);
+  await assert.rejects(response.arrayBuffer());
+  assert.equal(harness.child.exitCode, null);
+  assert.equal(harness.cloud.requests.length, 0);
+  const healthy = await fetch(`${harness.proxyRoot}/bot${remoteToken}/getMe`);
+  assert.equal(healthy.status, 200);
 });
