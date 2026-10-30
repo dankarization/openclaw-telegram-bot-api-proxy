@@ -1649,3 +1649,45 @@ test("cloud-local-cloud recovery advances the shared virtual cursor", async (t) 
   assert.deepEqual((await getUpdates(harness.proxyRoot, token, 1002)).map((update) => update.update_id), [1002]);
   assert.deepEqual(cloudOffsets, ["0", "11"]);
 });
+
+test("opt-in minimal debug log records buffered request flags without text or token", async (t) => {
+  const token = "123456:debug-log-token-abcdefghijklmnop";
+  const harness = await startHarness(t, {
+    env: { TELEGRAM_PROXY_DEBUG_LOG: "minimal" },
+    local(request) {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      return json(200, { ok: true, result: { message_id: 9, chat: { id: 77 } } });
+    },
+    cloud() {
+      return json(500, { ok: false, description: "cloud must not be used" });
+    },
+  });
+  const { status } = await rawBotApiRequest(harness.proxyRoot, token, "sendMessage", {
+    chat_id: 77,
+    text: "📝 private transcript",
+    disable_notification: true,
+  });
+  assert.equal(status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.match(harness.output.value, /debugLog=minimal/u);
+  assert.match(harness.output.value, /debug=minimal method=sendMessage status=200 ms=\d+ req=\{chat_id=77,disable_notification=true,text=<str:\d+>\} res=\{ok=true,message_id=9,chat_id=77\}/u);
+  assert.doesNotMatch(harness.output.value, /private transcript/u);
+  assert.doesNotMatch(harness.output.value, /debug-log-token/u);
+});
+
+test("debug log stays silent by default", async (t) => {
+  const harness = await startHarness(t, {
+    local(request) {
+      const health = healthyGetMe(request);
+      if (health) return health;
+      return json(200, { ok: true, result: { message_id: 1 } });
+    },
+    cloud() {
+      return json(500, { ok: false });
+    },
+  });
+  await rawBotApiRequest(harness.proxyRoot, "123456:default-off-token-abcdefghijk", "sendMessage", { chat_id: 1, text: "x" });
+  assert.match(harness.output.value, /debugLog=off/u);
+  assert.doesNotMatch(harness.output.value, /debug=/u);
+});
