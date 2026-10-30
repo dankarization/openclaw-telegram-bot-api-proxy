@@ -107,6 +107,24 @@ journalctl --user -u openclaw-telegram-api-proxy.service -n 100 --no-pager
 Bot token в логах должен иметь вид `<hidden-token>`. Полный token, message text
 и media payload в operational log не пишутся.
 
+### Debug log (opt-in)
+
+`TELEGRAM_PROXY_DEBUG_LOG` включает дополнительную строку `debug=...` на каждый
+buffered запрос (JSON/form/query; streaming upload/download не затрагиваются):
+
+| Режим | Что пишется |
+| --- | --- |
+| `off` (default) | Ничего дополнительного |
+| `minimal` | Ключи запроса, boolean/number значения (`disable_notification=true`, `chat_id=...`), `parse_mode`, длины строк (`text=<str:42>`), в ответе `ok`, `error_code`, `description`, `message_id`. Текст сообщений не пишется |
+| `full` | JSON payload и ответ целиком, `secret_token`/`provider_token` маскируются, длина ограничена `TELEGRAM_PROXY_DEBUG_MAX_CHARS` |
+
+Пустые long poll `getUpdates` не логируются; для непустых пишутся только
+количество и типы updates. `TELEGRAM_PROXY_DEBUG_METHODS` и
+`TELEGRAM_PROXY_DEBUG_SKIP_METHODS` фильтруют методы. Bot token маскируется тем
+же `<hidden-token>`. Режим `full` пишет текст пользователей: включайте его
+только на время отладки. Стартовая строка `listening=...` показывает текущий
+`debugLog=...`.
+
 ## Диагностика файлов
 
 ### `getFile`

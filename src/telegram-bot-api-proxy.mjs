@@ -2,6 +2,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 
+import { createDebugLogger, parseDebugLogConfig } from "./debug-log.mjs";
 import { createFallbackPolicy } from "./fallback-policy.mjs";
 import { createFileRouter } from "./file-routing.mjs";
 import { PerBotPollCoordinator } from "./per-bot-poll-coordinator.mjs";
@@ -106,6 +107,12 @@ const cloudFreshUpdateMaxAgeMs = Number.parseInt(process.env.CLOUD_FRESH_UPDATE_
 const localVirtualOffsetSkewMin = parsePositiveInteger(process.env.LOCAL_VIRTUAL_OFFSET_SKEW_MIN, 1000000);
 // Необязательные botId:localFloor:virtualFloor anchors сохраняют affine bridge через restart.
 const localUpdateStateSeed = process.env.LOCAL_UPDATE_STATE_SEED || "";
+
+// Opt-in debug log запросов/ответов: TELEGRAM_PROXY_DEBUG_LOG=off|minimal|full.
+const debugLogConfig = parseDebugLogConfig(process.env);
+const debugLogger = createDebugLogger(debugLogConfig);
+// Контекст buffered запроса для debug log, привязанный к response object.
+const debugContexts = new WeakMap();
 
 // Легкие счетчики живых streaming-запросов для operational logs.
 const streamingCounters = {
@@ -569,6 +576,15 @@ async function forwardLocalBuffered(req, method, token, body, options = {}) {
 }
 
 function writeBufferedResponse(res, upstream) {
+  const debugContext = debugLogger.enabled ? debugContexts.get(res) : null;
+  if (debugContext) {
+    try {
+      const line = debugLogger.format({ ...debugContext, upstream, ms: Date.now() - debugContext.startedAt });
+      if (line) log(line);
+    } catch (error) {
+      logError(`debug-log-failed ${errorLogFields(error)}`);
+    }
+  }
   const headers = copyHeaders(upstream.headers);
   headers["content-length"] = String(upstream.body.length);
   res.writeHead(upstream.statusCode, headers);
@@ -594,6 +610,15 @@ function writeGetFileFallbackBlocked(res, policy, localStatus) {
 async function handleBuffered(req, res, method, token, startedAt, options = {}) {
   const signal = options.signal;
   const body = options.body ?? await readRequestBody(req);
+  if (debugLogger.shouldLog(method)) {
+    debugContexts.set(res, {
+      method,
+      reqUrl: req.url,
+      contentType: req.headers["content-type"],
+      body,
+      startedAt,
+    });
+  }
   const pathname = new URL(req.url || "/", "http://proxy.local").pathname;
   const localIsHealthy = await checkLocalHealth(token, signal);
   const baseCloudFallback = cloudFallbackPolicy(method, token, pathname, req);
@@ -935,7 +960,7 @@ const server = http.createServer(async (req, res) => {
 
 // Запускаем listener только после полной инициализации правил fallback и in-memory state.
 server.listen(listenPort, listenHost, () => {
-  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} getUpdatesBodyReadTimeoutMs=${getUpdatesBodyReadTimeoutMs} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileDownloadTimeoutMs=${localGetFileDownloadTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs}`);
+  log(`listening=${listenHost}:${listenPort} local=${localRoot} cloud=${cloudRoot} cloudFallback=${cloudFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesFallback=${cloudGetUpdatesFallbackEnabled ? "enabled" : "disabled"} cloudGetUpdatesOnLocalEmpty=${cloudGetUpdatesOnLocalEmptyEnabled ? "enabled" : "disabled"} cloudPendingFallbackDelayMs=${cloudPendingFallbackDelayMs} localGetUpdatesTimeout=${localGetUpdatesTimeoutSeconds} localGetUpdatesAttempts=${localGetUpdatesMaxAttempts} maxQueuedGetUpdatesPerBot=${maxQueuedGetUpdatesPerBot} getUpdatesBodyReadTimeoutMs=${getUpdatesBodyReadTimeoutMs} localGetFileTimeoutMs=${localGetFileUpstreamTimeoutMs} localGetFileDownloadTimeoutMs=${localGetFileDownloadTimeoutMs} localGetFileAttempts=${localGetFileMaxAttempts} localVirtualOffsetSkewMin=${localVirtualOffsetSkewMin} localUpdateStateSeeds=${seededLocalUpdateStateCount} cloudFileMaxBytes=${cloudFileFallbackMaxBytes} fileInfoCacheTtlMs=${fileInfoCacheTtlMs} fileUpdateInfoCacheTtlMs=${fileUpdateInfoCacheTtlMs} debugLog=${debugLogConfig.mode}${debugLogConfig.invalidMode ? "(invalid-value)" : ""}`);
 });
 
 // При остановке systemd закрываем listener штатно, но не зависаем дольше пяти секунд.
